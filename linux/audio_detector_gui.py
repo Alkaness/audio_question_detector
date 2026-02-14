@@ -824,54 +824,20 @@ class OverlayWindow(QWidget):
         layout.addWidget(self.text_display)
 
     def setup_stealth(self):
-        """Set up stealth mode: multi-layered screen capture exclusion"""
-        # Apply X11 hints after window is shown (needs valid window ID)
-        QTimer.singleShot(500, self._apply_x11_stealth)
+        """Stealth mode via Qt window flags (works on both Wayland and X11).
 
-    def _apply_x11_stealth(self):
-        """Apply multiple X11 hints for screen capture exclusion.
+        Qt.Tool — hides from taskbar
+        Qt.FramelessWindowHint — no title bar or borders
+        Qt.WindowTransparentForInput — clicks pass through
+        Qt.WindowStaysOnTopHint — always on top
+        WA_TranslucentBackground — transparent background
 
-        Layer 1: _NET_WM_WINDOW_TYPE_NOTIFICATION — tells WM to treat as notification,
-                 some capture tools skip notification windows.
-        Layer 2: _NET_WM_BYPASS_COMPOSITOR — renders directly to GPU framebuffer/overlay
-                 plane, bypassing the compositor's composite buffer that XComposite-based
-                 capture tools (including Chrome WebRTC) read from.
-        Layer 3: _NET_WM_STATE — skip taskbar and pager to reduce window visibility.
-
-        Note: These hints only work on X11/Xorg sessions. On Wayland, PipeWire
-        captures the final composited output and there is no API to exclude windows.
+        Note: On Linux there is no API to exclude a window from screen capture.
+        Use 'Share a window' (not full screen) in Google Meet as a workaround.
         """
-        try:
-            win_id = int(self.winId())
-            hex_id = hex(win_id)
-
-            # Layer 1: Window type NOTIFICATION (skip by some capture tools)
-            subprocess.run([
-                'xprop', '-id', hex_id,
-                '-f', '_NET_WM_WINDOW_TYPE', '32a',
-                '-set', '_NET_WM_WINDOW_TYPE', '_NET_WM_WINDOW_TYPE_NOTIFICATION'
-            ], capture_output=True, timeout=2)
-
-            # Layer 2: Bypass compositor — render direct to GPU overlay plane
-            # This is the key hint: content drawn outside the compositor's buffer
-            # becomes invisible to XComposite/XSHM-based screen capture
-            subprocess.run([
-                'xprop', '-id', hex_id,
-                '-f', '_NET_WM_BYPASS_COMPOSITOR', '32c',
-                '-set', '_NET_WM_BYPASS_COMPOSITOR', '1'
-            ], capture_output=True, timeout=2)
-
-            # Layer 3: Skip taskbar and pager, stay above other windows
-            subprocess.run([
-                'xprop', '-id', hex_id,
-                '-f', '_NET_WM_STATE', '32a',
-                '-set', '_NET_WM_STATE',
-                '_NET_WM_STATE_SKIP_TASKBAR,_NET_WM_STATE_SKIP_PAGER,_NET_WM_STATE_ABOVE'
-            ], capture_output=True, timeout=2)
-
-            print("[Stealth] X11 hints applied: NOTIFICATION + BYPASS_COMPOSITOR + SKIP_TASKBAR")
-        except Exception as e:
-            print(f"[Stealth] X11 hints not applied (may be Wayland session): {e}")
+        print("[Stealth] Qt window flags applied (Tool + Frameless + TransparentForInput)")
+        print("[Stealth] ⚠ Overlay IS visible in screen sharing on Linux.")
+        print("[Stealth] Workaround: share a specific window in Google Meet, not the entire screen.")
 
     def setup_hotkeys(self):
         """Set up global hotkeys"""
@@ -920,7 +886,6 @@ class OverlayWindow(QWidget):
             self.is_silent = False
             self.show()
             self.raise_()
-            QTimer.singleShot(500, self._apply_x11_stealth)
 
     def _kill_app(self):
         """Double F3: terminate the application"""

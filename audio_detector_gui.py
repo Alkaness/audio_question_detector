@@ -121,7 +121,7 @@ class WorkerSignals(QObject):
 class AudioDetectorWorker:
     """Worker for audio processing in a separate thread"""
 
-    def __init__(self, device_index, signals, sample_rate=SAMPLE_RATE):
+    def __init__(self, device_index, signals, sample_rate=SAMPLE_RATE, language="Ukrainian"):
         self.device_index = device_index
         self.signals = signals
         self.sample_rate = sample_rate
@@ -130,6 +130,7 @@ class AudioDetectorWorker:
         self.audio_queue = queue.Queue()
         self.last_transcription = ""
         self.conversation_history = []
+        self.language = language
 
         # Cached VAD parameters (computed once)
         self._min_frames = int(sample_rate * MIN_CHUNK_DURATION)
@@ -219,12 +220,12 @@ class AudioDetectorWorker:
     def answer_question(self, question):
         try:
             system_prompt = (
-                "You are a helpful AI assistant that answers any questions. "
-                "ALWAYS respond in Ukrainian, even if the question is in English. "
-                "Give concise, clear answers (2-3 sentences maximum). "
-                "If the question is about technology/programming, you may include a code example. "
-                "Explain in simple terms so the person can quickly understand and respond in conversation. "
-                "Take into account the context of previous questions and answers in the conversation."
+                f"You are a helpful AI assistant that answers any questions. "
+                f"ALWAYS respond in {self.language}, even if the question is in another language. "
+                f"Give concise, clear answers (2-3 sentences maximum). "
+                f"If the question is about technology/programming, you may include a code example. "
+                f"Explain in simple terms so the person can quickly understand and respond in conversation. "
+                f"Take into account the context of previous questions and answers in the conversation."
             )
             messages = [{"role": "system", "content": system_prompt}]
             for prev_q, prev_a in self.conversation_history[-10:]:
@@ -359,12 +360,18 @@ class HotkeyManager:
         self.last_f1_time = 0.0
         self.last_f2_time = 0.0
         self.last_f3_time = 0.0
+        self.last_f4_time = 0.0
+        self.last_f5_time = 0.0
+        self.last_f6_time = 0.0
         self.on_double_f1 = None
         self.on_double_f2 = None
         self.on_double_f3 = None
+        self.on_double_f4 = None  # Copy to clipboard
+        self.on_double_f5 = None  # Font size up
+        self.on_double_f6 = None  # Font size down
         self._thread = None
         self._running = False
-        self._listener = None  # pynput listener (Windows)
+        self._listener = None  # pynput listener (Windows/macOS)
 
     # ── Linux (evdev) ──
     def _find_keyboards(self):
@@ -420,10 +427,25 @@ class HotkeyManager:
                 if self.on_double_f3: self.on_double_f3()
                 self.last_f3_time = 0.0
             else: self.last_f3_time = now
+        elif code == ecodes.KEY_F4:
+            if now - self.last_f4_time < 0.4:
+                if self.on_double_f4: self.on_double_f4()
+                self.last_f4_time = 0.0
+            else: self.last_f4_time = now
+        elif code == ecodes.KEY_F5:
+            if now - self.last_f5_time < 0.4:
+                if self.on_double_f5: self.on_double_f5()
+                self.last_f5_time = 0.0
+            else: self.last_f5_time = now
+        elif code == ecodes.KEY_F6:
+            if now - self.last_f6_time < 0.4:
+                if self.on_double_f6: self.on_double_f6()
+                self.last_f6_time = 0.0
+            else: self.last_f6_time = now
 
     # ── Windows (pynput) ──
     def _on_key_press_pynput(self, key):
-        """Handle pynput key press (Windows)"""
+        """Handle pynput key press (Windows/macOS)"""
         now = time.time()
         try:
             if key == pynput_keyboard.Key.f1:
@@ -441,6 +463,21 @@ class HotkeyManager:
                     if self.on_double_f3: self.on_double_f3()
                     self.last_f3_time = 0.0
                 else: self.last_f3_time = now
+            elif key == pynput_keyboard.Key.f4:
+                if now - self.last_f4_time < 0.4:
+                    if self.on_double_f4: self.on_double_f4()
+                    self.last_f4_time = 0.0
+                else: self.last_f4_time = now
+            elif key == pynput_keyboard.Key.f5:
+                if now - self.last_f5_time < 0.4:
+                    if self.on_double_f5: self.on_double_f5()
+                    self.last_f5_time = 0.0
+                else: self.last_f5_time = now
+            elif key == pynput_keyboard.Key.f6:
+                if now - self.last_f6_time < 0.4:
+                    if self.on_double_f6: self.on_double_f6()
+                    self.last_f6_time = 0.0
+                else: self.last_f6_time = now
         except AttributeError:
             pass
 
@@ -450,11 +487,11 @@ class HotkeyManager:
             self._running = True
             self._thread = threading.Thread(target=self._listen_loop_evdev, daemon=True)
             self._thread.start()
-        elif IS_WINDOWS and PYNPUT_AVAILABLE:
+        elif (IS_WINDOWS or IS_MACOS) and PYNPUT_AVAILABLE:
             self._listener = pynput_keyboard.Listener(on_press=self._on_key_press_pynput)
             self._listener.daemon = True
             self._listener.start()
-            print("[HotkeyManager] pynput listener started. F1x2=hide, F2x2=show, F3x2=quit", flush=True)
+            print("[HotkeyManager] pynput listener started. F1-F6 hotkeys active", flush=True)
 
     def stop(self):
         self._running = False
@@ -533,12 +570,12 @@ class ConfigWindow(QMainWindow):
 
     def init_ui(self):
         self.setWindowTitle("Audio Question Detector — Settings")
-        self.setFixedSize(500, 350)
+        self.setFixedSize(500, 400)
 
         # Center on screen
         screen = QDesktopWidget().screenGeometry()
         x = (screen.width() - 500) // 2
-        y = (screen.height() - 350) // 2
+        y = (screen.height() - 400) // 2
         self.move(x, y)
 
         # Style — dark grey background
@@ -613,6 +650,19 @@ class ConfigWindow(QMainWindow):
         mode_layout.addWidget(self.mode_combo)
         settings_layout.addLayout(mode_layout)
 
+        # Language
+        lang_layout = QHBoxLayout()
+        lang_label = QLabel("Language:")
+        lang_label.setFixedWidth(80)
+        lang_layout.addWidget(lang_label)
+        self.lang_combo = QComboBox()
+        self.lang_combo.addItems([
+            "Ukrainian", "English", "Russian", "German",
+            "French", "Spanish", "Polish", "Chinese", "Japanese"
+        ])
+        lang_layout.addWidget(self.lang_combo)
+        settings_layout.addLayout(lang_layout)
+
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
 
@@ -680,16 +730,17 @@ class ConfigWindow(QMainWindow):
 
         source_name, device_index, sample_rate = config
         mode = self.mode_combo.currentIndex()
+        language = self.lang_combo.currentText()
 
         self.hide()
 
         if mode == 0:
             # Test Mode
-            self.test_window = TestModeWindow(device_index, sample_rate, self)
+            self.test_window = TestModeWindow(device_index, sample_rate, self, language)
             self.test_window.show()
         else:
             # Overlay Mode
-            self.overlay_window = OverlayWindow(device_index, sample_rate, self)
+            self.overlay_window = OverlayWindow(device_index, sample_rate, self, language)
             self.overlay_window.show()
 
     def show_config(self):
@@ -706,11 +757,12 @@ class ConfigWindow(QMainWindow):
 class TestModeWindow(QMainWindow):
     """Test Mode — standard window with log and answers"""
 
-    def __init__(self, device_index, sample_rate, config_window):
+    def __init__(self, device_index, sample_rate, config_window, language="Ukrainian"):
         super().__init__()
         self.config_window = config_window
         self.device_index = device_index
         self.sample_rate = sample_rate
+        self.language = language
         self.worker = None
         self.worker_thread = None
         self.init_ui()
@@ -812,7 +864,7 @@ class TestModeWindow(QMainWindow):
         signals = WorkerSignals()
         signals.log.connect(self.log_message)
         signals.question.connect(self.add_qa)
-        self.worker = AudioDetectorWorker(self.device_index, signals, self.sample_rate)
+        self.worker = AudioDetectorWorker(self.device_index, signals, self.sample_rate, self.language)
         self.worker_thread = threading.Thread(target=self.worker.run, daemon=True)
         self.worker_thread.start()
         self.log_message("Detection started!", "success")
@@ -845,16 +897,19 @@ class OverlayWindow(QWidget):
     sig_hide = pyqtSignal()
     sig_show = pyqtSignal()
 
-    def __init__(self, device_index, sample_rate, config_window):
+    def __init__(self, device_index, sample_rate, config_window, language="Ukrainian"):
         super().__init__()
         self.config_window = config_window
         self.device_index = device_index
         self.sample_rate = sample_rate
+        self.language = language
         self.worker = None
         self.worker_thread = None
         self.hotkey_manager = None
         self.is_silent = False
-        self._pending_action = None  # 'hide', 'show', or 'kill' — for QTimer polling
+        self._pending_action = None  # 'hide', 'show', 'kill', 'copy', 'font_up', 'font_down'
+        self.last_answer = ""  # For clipboard copy
+        self.overlay_font_size = 16  # Default font size for answers
 
         # Signals for thread-safe updates
         self.sig_hide.connect(self._go_silent)
@@ -976,6 +1031,9 @@ class OverlayWindow(QWidget):
         self.hotkey_manager.on_double_f1 = self._request_hide
         self.hotkey_manager.on_double_f2 = self._request_show
         self.hotkey_manager.on_double_f3 = self._request_kill
+        self.hotkey_manager.on_double_f4 = self._request_copy
+        self.hotkey_manager.on_double_f5 = self._request_font_up
+        self.hotkey_manager.on_double_f6 = self._request_font_down
         self.hotkey_manager.start()
 
     def _request_hide(self):
@@ -990,6 +1048,18 @@ class OverlayWindow(QWidget):
         """Called from listener thread — terminate app"""
         self._pending_action = 'kill'
 
+    def _request_copy(self):
+        """Called from listener thread — copy last answer"""
+        self._pending_action = 'copy'
+
+    def _request_font_up(self):
+        """Called from listener thread — increase font"""
+        self._pending_action = 'font_up'
+
+    def _request_font_down(self):
+        """Called from listener thread — decrease font"""
+        self._pending_action = 'font_down'
+
     def _poll_hotkey_action(self):
         """Check flag every 100ms (runs in GUI thread)"""
         action = self._pending_action
@@ -1002,6 +1072,12 @@ class OverlayWindow(QWidget):
             self._restore()
         elif action == 'kill':
             self._kill_app()
+        elif action == 'copy':
+            self._copy_to_clipboard()
+        elif action == 'font_up':
+            self._change_font_size(2)
+        elif action == 'font_down':
+            self._change_font_size(-2)
 
     def _go_silent(self):
         """Double F1: hide and stop output"""
@@ -1023,6 +1099,34 @@ class OverlayWindow(QWidget):
             self.hotkey_manager.stop()
         QApplication.quit()
 
+    def _copy_to_clipboard(self):
+        """Double F4: copy last answer to clipboard"""
+        if self.last_answer:
+            clipboard = QApplication.clipboard()
+            clipboard.setText(self.last_answer)
+            # Brief visual feedback
+            self.text_display.append(
+                '<div style="color: #ffd54f; font-size: 12px; text-align: center;">'
+                '📋 Answer copied to clipboard</div>'
+            )
+            self.text_display.moveCursor(QTextCursor.End)
+        else:
+            self.text_display.append(
+                '<div style="color: #ff8a65; font-size: 12px; text-align: center;">'
+                'No answer to copy yet</div>'
+            )
+            self.text_display.moveCursor(QTextCursor.End)
+
+    def _change_font_size(self, delta):
+        """Change overlay answer font size by delta px"""
+        self.overlay_font_size = max(10, min(40, self.overlay_font_size + delta))
+        # Brief visual feedback
+        self.text_display.append(
+            f'<div style="color: #b0bec5; font-size: 12px; text-align: center;">'
+            f'Font size: {self.overlay_font_size}px</div>'
+        )
+        self.text_display.moveCursor(QTextCursor.End)
+
     def log_message(self, message, level="info"):
         """Log in overlay — debug only, not shown"""
         pass  # Overlay shows only Q&A
@@ -1031,11 +1135,13 @@ class OverlayWindow(QWidget):
         """Add answer to overlay"""
         if self.is_silent:
             return
+        self.last_answer = answer  # Store for clipboard copy
+        fs = self.overlay_font_size
         self.text_display.append(
             f'<div style="margin-bottom: 15px;">'
-            f'<div style="color: #64b5f6; font-size: 14px; margin-bottom: 5px;">'
+            f'<div style="color: #64b5f6; font-size: {fs - 2}px; margin-bottom: 5px;">'
             f'<b>Q:</b> {question}</div>'
-            f'<div style="color: #e8f5e9; font-size: 16px; line-height: 1.5;">'
+            f'<div style="color: #e8f5e9; font-size: {fs}px; line-height: 1.5;">'
             f'<b>A:</b> {answer}</div>'
             f'<hr style="border-color: #333;">'
             f'</div>'
@@ -1046,7 +1152,7 @@ class OverlayWindow(QWidget):
         signals = WorkerSignals()
         signals.log.connect(self.log_message)
         signals.question.connect(self.add_qa)
-        self.worker = AudioDetectorWorker(self.device_index, signals, self.sample_rate)
+        self.worker = AudioDetectorWorker(self.device_index, signals, self.sample_rate, self.language)
         self.worker_thread = threading.Thread(target=self.worker.run, daemon=True)
         self.worker_thread.start()
 

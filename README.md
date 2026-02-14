@@ -64,20 +64,24 @@ Or use launchers: `./launch.sh` (Linux/macOS) or `launch.bat` (Windows).
 
 ## Usage
 
-### Modes
+### Settings
 
-| Mode | Description |
-|------|-------------|
-| **Test Mode** | Standard window with log output and Q&A display |
-| **Overlay Mode** | Transparent fullscreen overlay (always on top, click-through) |
+| Option | Description |
+|--------|-------------|
+| **Source** | Audio input device (system audio monitor or microphone) |
+| **Mode** | Test Mode (windowed) or Overlay Mode (transparent fullscreen) |
+| **Language** | Answer language (Ukrainian, English, Russian, German, French, Spanish, Polish, Chinese, Japanese) |
 
 ### Overlay Hotkeys
 
 | Key | Action |
 |-----|--------|
-| F1 x2 | Hide overlay |
-| F2 x2 | Restore overlay |
-| F3 x2 | Terminate the application |
+| F1 ×2 | Hide overlay |
+| F2 ×2 | Restore overlay |
+| F3 ×2 | Terminate the application |
+| F4 ×2 | Copy last answer to clipboard |
+| F5 ×2 | Increase font size |
+| F6 ×2 | Decrease font size |
 | Escape | Close overlay → Settings |
 
 ### Screen Sharing Privacy
@@ -94,8 +98,11 @@ Or use launchers: `./launch.sh` (Linux/macOS) or `launch.bat` (Windows).
 - 🧠 VAD-based speech chunking with Whisper transcription
 - 💡 AI-powered answers via Groq LLaMA 3.3 70B
 - 🔒 Overlay mode — invisible to screen capture on Windows & macOS
-- ⌨️ Global hotkeys (F1×2 hide, F2×2 show, F3×2 quit)
-- 🇺🇦 Answers in Ukrainian
+- 🌐 Configurable answer language (9 languages)
+- 💬 Conversation context memory (last 10 Q&A pairs)
+- 📋 Copy answers to clipboard (F4×2)
+- 🔤 Adjustable font size (F5×2 / F6×2)
+- ⌨️ Global hotkeys (F1-F6 double-press)
 
 ## Architecture
 

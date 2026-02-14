@@ -277,6 +277,24 @@ All hotkeys require a double-press within 400ms to prevent accidental activation
 | F3 x2 | Terminate the application |
 | Escape | Close overlay and return to Configuration Window |
 
+### Screen Sharing Privacy
+
+The overlay uses multi-layered stealth to avoid appearing in screen shares:
+
+- **`_NET_WM_WINDOW_TYPE_NOTIFICATION`** — tells the window manager to treat the window as a transient notification
+- **`_NET_WM_BYPASS_COMPOSITOR`** — requests the GPU to render the window outside the compositor's buffer, making it invisible to XComposite/XSHM-based capture tools
+- **`_NET_WM_STATE_SKIP_TASKBAR`** — hides from taskbar, pager, and Alt-Tab
+- **`Qt.Tool | Qt.WindowTransparentForInput`** — hides from the taskbar and passes mouse clicks through
+
+**Important:** These hints are effective only on **X11/Xorg sessions**. On **Wayland** (default on modern Ubuntu/Fedora), PipeWire captures the final composited framebuffer and no API exists to exclude individual windows. Linux has no equivalent to Windows `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`.
+
+**Recommended workarounds for Wayland:**
+
+1. **Share a specific window** — in Google Meet, select the "Window" tab and share only the browser or app window, not the entire screen. The overlay is a separate window and will not be included.
+2. **Use a second monitor** — place the overlay on monitor 2 and share only monitor 1.
+3. **Toggle visibility** — press F1 x2 to hide the overlay before sharing, press F2 x2 to restore it afterwards.
+4. **Switch to X11** — log out, select "Ubuntu on Xorg" at the login screen, and log back in for best-effort stealth.
+
 ---
 
 ## Architecture

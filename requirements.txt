@@ -5,10 +5,13 @@ groq>=0.4.0
 pyttsx3>=2.90
 PyQt5>=5.15.0
 
-# Linux: evdev for global hotkeys (via raw /dev/input)
-# Install: pip install evdev
+# Linux: evdev for global hotkeys (raw /dev/input)
 # Requires: sudo usermod -aG input $USER
 evdev>=1.6.0; sys_platform == 'linux'
 
-# Windows: pynput for global hotkeys
+# Windows & macOS: pynput for global hotkeys
 pynput>=1.7.0; sys_platform == 'win32'
+pynput>=1.7.0; sys_platform == 'darwin'
+
+# macOS: PyObjC for screen capture exclusion (NSWindow.sharingType)
+pyobjc-framework-Cocoa>=9.0; sys_platform == 'darwin'

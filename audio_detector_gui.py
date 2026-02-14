@@ -28,11 +28,13 @@ import platform
 
 IS_WINDOWS = platform.system() == 'Windows'
 IS_LINUX = platform.system() == 'Linux'
+IS_MACOS = platform.system() == 'Darwin'
 
 # Platform-specific hotkey backend
 EVDEV_AVAILABLE = False
 PYNPUT_AVAILABLE = False
 WIN32_AVAILABLE = False
+OBJC_AVAILABLE = False
 
 if IS_LINUX:
     try:
@@ -42,6 +44,7 @@ if IS_LINUX:
     except ImportError:
         print("Warning: evdev not installed. Hotkeys disabled. Install: pip install evdev")
 else:
+    # Windows and macOS both use pynput
     try:
         from pynput import keyboard as pynput_keyboard
         PYNPUT_AVAILABLE = True
@@ -57,6 +60,15 @@ if IS_WINDOWS:
         WIN32_AVAILABLE = True
     except AttributeError:
         pass
+
+# macOS screen capture exclusion via PyObjC
+if IS_MACOS:
+    try:
+        from AppKit import NSApplication, NSWindow
+        OBJC_AVAILABLE = True
+    except ImportError:
+        print("Warning: pyobjc not installed. Screen capture exclusion disabled.")
+        print("Install: pip install pyobjc-framework-Cocoa")
 
 # Load env
 load_dotenv()
@@ -901,9 +913,12 @@ class OverlayWindow(QWidget):
         """Platform-aware stealth mode.
         Linux: Qt window flags only (no API to exclude from screen capture).
         Windows: SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE).
+        macOS: NSWindow.sharingType = .none (macOS 12+).
         """
         if IS_WINDOWS:
             QTimer.singleShot(500, self._apply_win32_stealth)
+        elif IS_MACOS:
+            QTimer.singleShot(500, self._apply_macos_stealth)
         else:
             print("[Stealth] Qt window flags applied (Tool + Frameless + TransparentForInput)")
             print("[Stealth] ⚠ Overlay IS visible in screen sharing on Linux.")
@@ -928,6 +943,30 @@ class OverlayWindow(QWidget):
                     print(f"[Stealth] SetWindowDisplayAffinity failed")
         except Exception as e:
             print(f"[Stealth] Win32 stealth error: {e}")
+
+    def _apply_macos_stealth(self):
+        """macOS: NSWindow.sharingType = .none to exclude from screen capture.
+        Available on macOS 12.0+ (Monterey). Makes the window invisible to
+        screenshots, screen recording, AirPlay, and screen sharing apps.
+        """
+        if not OBJC_AVAILABLE:
+            print("[Stealth] PyObjC not available. Install: pip install pyobjc-framework-Cocoa")
+            return
+        try:
+            # Get the native NSWindow from Qt's window handle
+            ns_app = NSApplication.sharedApplication()
+            for ns_window in ns_app.windows():
+                # Match by window title or find the frameless fullscreen one
+                frame = ns_window.frame()
+                if frame.size.width > 100 and frame.size.height > 100:
+                    # sharingType 0 = NSWindowSharingNone (macOS 12+)
+                    if hasattr(ns_window, 'setSharingType_'):
+                        ns_window.setSharingType_(0)  # NSWindowSharingNone
+                        print("[Stealth] NSWindow.sharingType = .none — overlay invisible to capture")
+                        return
+            print("[Stealth] Could not find NSWindow to apply sharingType")
+        except Exception as e:
+            print(f"[Stealth] macOS stealth error: {e}")
 
     def setup_hotkeys(self):
         """Set up global hotkeys"""

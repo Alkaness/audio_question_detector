@@ -71,6 +71,7 @@ Or use launchers: `./launch.sh` (Linux/macOS) or `launch.bat` (Windows).
 | **Source** | Audio input device (system audio monitor or microphone) |
 | **Mode** | Test Mode (windowed) or Overlay Mode (transparent fullscreen) |
 | **Language** | Answer language (Ukrainian, English, Russian, German, French, Spanish, Polish, Chinese, Japanese) |
+| **Topic** | Context topic for better answers (e.g. "Python backend interview", "System design") |
 
 ### Overlay Hotkeys
 
@@ -84,6 +85,13 @@ Or use launchers: `./launch.sh` (Linux/macOS) or `launch.bat` (Windows).
 | F6 ×2 | Decrease font size |
 | Escape | Close overlay → Settings |
 
+### Answer History
+
+All Q&A pairs are automatically saved to `~/.audio_detector_history.json`. Access the browsable history panel via the **📜 View History** button in Settings. Features:
+- 🔍 Search through questions and answers
+- 🗑️ Clear all history
+- Timestamps, language, and topic metadata per entry
+
 ### Screen Sharing Privacy
 
 | Platform | Method | Result |
@@ -95,19 +103,36 @@ Or use launchers: `./launch.sh` (Linux/macOS) or `launch.bat` (Windows).
 ## Features
 
 - 🎤 Real-time audio capture (system audio or microphone)
-- 🧠 VAD-based speech chunking with Whisper transcription
+- 🧠 WebRTC VAD speech detection (ML-based, with RMS fallback)
 - 💡 AI-powered answers via Groq LLaMA 3.3 70B
 - 🔒 Overlay mode — invisible to screen capture on Windows & macOS
 - 🌐 Configurable answer language (9 languages)
+- 🎯 Topic/keyword context for domain-specific answers
 - 💬 Conversation context memory (last 10 Q&A pairs)
 - 📋 Copy answers to clipboard (F4×2)
 - 🔤 Adjustable font size (F5×2 / F6×2)
+- 📜 Searchable answer history panel with JSON storage
 - ⌨️ Global hotkeys (F1-F6 double-press)
+
+## Building Standalone Executable
+
+Bundle as a standalone app (no Python needed):
+
+```bash
+pip install pyinstaller
+python build.py
+```
+
+Output:
+- **Windows**: `dist/AudioQuestionDetector.exe`
+- **macOS**: `dist/AudioQuestionDetector.app`
+- **Linux**: `dist/AudioQuestionDetector` (run directly or create AppImage)
 
 ## Architecture
 
 ```
 audio_detector_gui.py  — Main application (cross-platform)
+build.py               — PyInstaller build script
 requirements.txt       — Python dependencies (platform-conditional)
 launch.sh              — Linux / macOS launcher
 launch.bat             — Windows launcher

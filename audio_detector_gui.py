@@ -5,17 +5,17 @@ Cross-platform: auto-detects Linux/Windows for hotkeys, audio sources, and steal
 Multi-window architecture: Config → Test Mode / Overlay Mode
 """
 
-import sys
-import os
-import subprocess
-import threading
-import queue
+import sys, os, time, queue, threading, subprocess, struct
+import wave, json, platform
 from io import BytesIO
-import wave
-import time
+from datetime import datetime
+from pathlib import Path
+import logging
+
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QComboBox,
-                             QTextEdit, QGroupBox, QMessageBox, QDesktopWidget)
+                             QTextEdit, QGroupBox, QMessageBox, QDesktopWidget,
+                             QLineEdit, QDialog, QScrollArea)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QFont, QTextCursor, QColor, QPalette
 
@@ -70,6 +70,17 @@ if IS_MACOS:
         print("Warning: pyobjc not installed. Screen capture exclusion disabled.")
         print("Install: pip install pyobjc-framework-Cocoa")
 
+# WebRTC VAD for better speech detection
+WEBRTC_VAD_AVAILABLE = False
+try:
+    import webrtcvad
+    WEBRTC_VAD_AVAILABLE = True
+except ImportError:
+    pass  # Falls back to RMS-based VAD
+
+# History file path
+HISTORY_FILE = Path.home() / ".audio_detector_history.json"
+
 # Load env
 load_dotenv()
 
@@ -121,7 +132,7 @@ class WorkerSignals(QObject):
 class AudioDetectorWorker:
     """Worker for audio processing in a separate thread"""
 
-    def __init__(self, device_index, signals, sample_rate=SAMPLE_RATE, language="Ukrainian"):
+    def __init__(self, device_index, signals, sample_rate=SAMPLE_RATE, language="Ukrainian", topic=""):
         self.device_index = device_index
         self.signals = signals
         self.sample_rate = sample_rate
@@ -131,6 +142,16 @@ class AudioDetectorWorker:
         self.last_transcription = ""
         self.conversation_history = []
         self.language = language
+        self.topic = topic
+
+        # WebRTC VAD (if available)
+        self._vad = None
+        if WEBRTC_VAD_AVAILABLE:
+            try:
+                self._vad = webrtcvad.Vad(2)  # aggressiveness 0-3 (2 = balanced)
+                self.signals.log.emit("Using WebRTC VAD (ML-based speech detection)", "success")
+            except Exception:
+                pass
 
         # Cached VAD parameters (computed once)
         self._min_frames = int(sample_rate * MIN_CHUNK_DURATION)
@@ -219,9 +240,13 @@ class AudioDetectorWorker:
 
     def answer_question(self, question):
         try:
+            topic_ctx = ""
+            if self.topic:
+                topic_ctx = f"The conversation topic is: {self.topic}. Focus your answers on this domain. "
             system_prompt = (
                 f"You are a helpful AI assistant that answers any questions. "
                 f"ALWAYS respond in {self.language}, even if the question is in another language. "
+                f"{topic_ctx}"
                 f"Give concise, clear answers (2-3 sentences maximum). "
                 f"If the question is about technology/programming, you may include a code example. "
                 f"Explain in simple terms so the person can quickly understand and respond in conversation. "
@@ -244,15 +269,67 @@ class AudioDetectorWorker:
             self.conversation_history.append((question, answer))
             if len(self.conversation_history) > 10:
                 self.conversation_history = self.conversation_history[-10:]
+            # Save to history file
+            self._save_to_history(question, answer)
             return answer
         except Exception as e:
             self.signals.log.emit(f"Answer generation error: {e}", "error")
             return "Sorry, could not generate an answer."
 
+    def _save_to_history(self, question, answer):
+        """Append Q&A to history JSON file."""
+        try:
+            history = []
+            if HISTORY_FILE.exists():
+                with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+            history.append({
+                "timestamp": datetime.now().isoformat(),
+                "question": question,
+                "answer": answer,
+                "language": self.language,
+                "topic": self.topic
+            })
+            with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass  # Don't break detection over history file errors
+
     def has_speech(self, audio_data):
-        # np.dot is faster than mean(x**2) for large arrays
+        """Detect speech using WebRTC VAD (preferred) or RMS fallback."""
+        if self._vad and WEBRTC_VAD_AVAILABLE:
+            return self._has_speech_webrtcvad(audio_data)
+        # RMS fallback
         rms = np.sqrt(np.dot(audio_data, audio_data) / len(audio_data))
         return rms > SILENCE_THRESHOLD
+
+    def _has_speech_webrtcvad(self, audio_data):
+        """WebRTC VAD: check if audio contains speech.
+        webrtcvad requires 16-bit PCM at 8/16/32/48 kHz in 10/20/30ms frames.
+        """
+        try:
+            # Convert float32 to int16 PCM
+            audio_int16 = np.clip(audio_data * 32767, -32768, 32767).astype(np.int16)
+            pcm_bytes = audio_int16.tobytes()
+            # Frame size: 30ms at sample_rate
+            frame_size = int(self.sample_rate * 0.03)  # 30ms
+            frame_bytes = frame_size * 2  # 16-bit = 2 bytes per sample
+            speech_frames = 0
+            total_frames = 0
+            for i in range(0, len(pcm_bytes) - frame_bytes, frame_bytes):
+                frame = pcm_bytes[i:i + frame_bytes]
+                if len(frame) == frame_bytes:
+                    total_frames += 1
+                    if self._vad.is_speech(frame, self.sample_rate):
+                        speech_frames += 1
+            if total_frames == 0:
+                return False
+            # Speech if >15% of frames contain speech
+            return (speech_frames / total_frames) > 0.15
+        except Exception:
+            # Fallback to RMS
+            rms = np.sqrt(np.dot(audio_data, audio_data) / len(audio_data))
+            return rms > SILENCE_THRESHOLD
 
     def detect_silence_split(self, buffer):
         buf_len = len(buffer)
@@ -570,12 +647,12 @@ class ConfigWindow(QMainWindow):
 
     def init_ui(self):
         self.setWindowTitle("Audio Question Detector — Settings")
-        self.setFixedSize(500, 400)
+        self.setFixedSize(500, 480)
 
         # Center on screen
         screen = QDesktopWidget().screenGeometry()
         x = (screen.width() - 500) // 2
-        y = (screen.height() - 400) // 2
+        y = (screen.height() - 480) // 2
         self.move(x, y)
 
         # Style — dark grey background
@@ -663,6 +740,21 @@ class ConfigWindow(QMainWindow):
         lang_layout.addWidget(self.lang_combo)
         settings_layout.addLayout(lang_layout)
 
+        # Topic context
+        topic_layout = QHBoxLayout()
+        topic_label = QLabel("Topic:")
+        topic_label.setFixedWidth(80)
+        topic_layout.addWidget(topic_label)
+        self.topic_input = QLineEdit()
+        self.topic_input.setPlaceholderText("e.g. Python backend interview, System design...")
+        self.topic_input.setStyleSheet(
+            "background-color: #3a3a3a; color: #e0e0e0; "
+            "border: 1px solid #555; border-radius: 4px; "
+            "padding: 8px; font-size: 13px;"
+        )
+        topic_layout.addWidget(self.topic_input)
+        settings_layout.addLayout(topic_layout)
+
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
 
@@ -678,6 +770,19 @@ class ConfigWindow(QMainWindow):
         """)
         self.start_btn.clicked.connect(self.launch_mode)
         layout.addWidget(self.start_btn)
+
+        # History button
+        self.history_btn = QPushButton("📜 View History")
+        self.history_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #37474f; color: #b0bec5;
+                font-size: 13px; padding: 8px 20px;
+                border-radius: 6px; border: none;
+            }
+            QPushButton:hover { background-color: #455a64; }
+        """)
+        self.history_btn.clicked.connect(self.show_history)
+        layout.addWidget(self.history_btn)
 
         # Populate sources
         self.refresh_sources()
@@ -731,16 +836,17 @@ class ConfigWindow(QMainWindow):
         source_name, device_index, sample_rate = config
         mode = self.mode_combo.currentIndex()
         language = self.lang_combo.currentText()
+        topic = self.topic_input.text().strip()
 
         self.hide()
 
         if mode == 0:
             # Test Mode
-            self.test_window = TestModeWindow(device_index, sample_rate, self, language)
+            self.test_window = TestModeWindow(device_index, sample_rate, self, language, topic)
             self.test_window.show()
         else:
             # Overlay Mode
-            self.overlay_window = OverlayWindow(device_index, sample_rate, self, language)
+            self.overlay_window = OverlayWindow(device_index, sample_rate, self, language, topic)
             self.overlay_window.show()
 
     def show_config(self):
@@ -748,6 +854,11 @@ class ConfigWindow(QMainWindow):
         self.show()
         self.raise_()
         self.activateWindow()
+
+    def show_history(self):
+        """Open history window"""
+        self.history_window = HistoryWindow(self)
+        self.history_window.show()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -757,12 +868,13 @@ class ConfigWindow(QMainWindow):
 class TestModeWindow(QMainWindow):
     """Test Mode — standard window with log and answers"""
 
-    def __init__(self, device_index, sample_rate, config_window, language="Ukrainian"):
+    def __init__(self, device_index, sample_rate, config_window, language="Ukrainian", topic=""):
         super().__init__()
         self.config_window = config_window
         self.device_index = device_index
         self.sample_rate = sample_rate
         self.language = language
+        self.topic = topic
         self.worker = None
         self.worker_thread = None
         self.init_ui()
@@ -864,7 +976,7 @@ class TestModeWindow(QMainWindow):
         signals = WorkerSignals()
         signals.log.connect(self.log_message)
         signals.question.connect(self.add_qa)
-        self.worker = AudioDetectorWorker(self.device_index, signals, self.sample_rate, self.language)
+        self.worker = AudioDetectorWorker(self.device_index, signals, self.sample_rate, self.language, self.topic)
         self.worker_thread = threading.Thread(target=self.worker.run, daemon=True)
         self.worker_thread.start()
         self.log_message("Detection started!", "success")
@@ -897,12 +1009,13 @@ class OverlayWindow(QWidget):
     sig_hide = pyqtSignal()
     sig_show = pyqtSignal()
 
-    def __init__(self, device_index, sample_rate, config_window, language="Ukrainian"):
+    def __init__(self, device_index, sample_rate, config_window, language="Ukrainian", topic=""):
         super().__init__()
         self.config_window = config_window
         self.device_index = device_index
         self.sample_rate = sample_rate
         self.language = language
+        self.topic = topic
         self.worker = None
         self.worker_thread = None
         self.hotkey_manager = None
@@ -1152,7 +1265,7 @@ class OverlayWindow(QWidget):
         signals = WorkerSignals()
         signals.log.connect(self.log_message)
         signals.question.connect(self.add_qa)
-        self.worker = AudioDetectorWorker(self.device_index, signals, self.sample_rate, self.language)
+        self.worker = AudioDetectorWorker(self.device_index, signals, self.sample_rate, self.language, self.topic)
         self.worker_thread = threading.Thread(target=self.worker.run, daemon=True)
         self.worker_thread.start()
 
@@ -1181,6 +1294,180 @@ class OverlayWindow(QWidget):
             self.hotkey_manager.stop()
         self.config_window.show_config()
         event.accept()
+
+
+# ═══════════════════════════════════════════════════════════════
+# Answer History Window
+# ═══════════════════════════════════════════════════════════════
+
+class HistoryWindow(QDialog):
+    """Browsable Q&A history window with search and clear"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Answer History")
+        self.setMinimumSize(700, 500)
+
+        self.setStyleSheet("""
+            QDialog { background-color: #1e1e1e; }
+            QLabel { color: #e0e0e0; }
+            QLineEdit {
+                background-color: #3a3a3a; color: #e0e0e0;
+                border: 1px solid #555; border-radius: 4px;
+                padding: 8px; font-size: 13px;
+            }
+            QTextEdit {
+                background-color: #252525; color: #d4d4d4;
+                border: 1px solid #3a3a3a; border-radius: 4px;
+                font-size: 13px;
+            }
+            QPushButton {
+                font-size: 13px; padding: 8px 20px;
+                border-radius: 6px; border: none;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(15, 15, 15, 15)
+
+        # Header
+        header = QHBoxLayout()
+        title = QLabel("\ud83d\udcdc Answer History")
+        title.setFont(QFont("Arial", 16, QFont.Bold))
+        title.setStyleSheet("color: #ffffff;")
+        header.addWidget(title)
+        header.addStretch()
+
+        self.count_label = QLabel("")
+        self.count_label.setStyleSheet("color: #b0b0b0; font-size: 12px;")
+        header.addWidget(self.count_label)
+        layout.addLayout(header)
+
+        # Search bar
+        search_layout = QHBoxLayout()
+        search_label = QLabel("\ud83d\udd0d")
+        search_layout.addWidget(search_label)
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search questions and answers...")
+        self.search_input.textChanged.connect(self.filter_history)
+        search_layout.addWidget(self.search_input)
+        layout.addLayout(search_layout)
+
+        # History display
+        self.history_text = QTextEdit()
+        self.history_text.setReadOnly(True)
+        layout.addWidget(self.history_text)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        clear_btn = QPushButton("\ud83d\uddd1\ufe0f Clear All History")
+        clear_btn.setStyleSheet("""
+            QPushButton { background-color: #c62828; color: white; }
+            QPushButton:hover { background-color: #e53935; }
+        """)
+        clear_btn.clicked.connect(self.clear_history)
+        btn_layout.addWidget(clear_btn)
+
+        btn_layout.addStretch()
+
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet("""
+            QPushButton { background-color: #37474f; color: #b0bec5; }
+            QPushButton:hover { background-color: #455a64; }
+        """)
+        close_btn.clicked.connect(self.close)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+        # Load history
+        self.all_entries = []
+        self.load_history()
+
+    def load_history(self):
+        """Load history from JSON file"""
+        self.all_entries = []
+        try:
+            if HISTORY_FILE.exists():
+                with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                    self.all_entries = json.load(f)
+        except Exception:
+            pass
+        self.display_entries(self.all_entries)
+
+    def display_entries(self, entries):
+        """Display a list of history entries"""
+        self.history_text.clear()
+        self.count_label.setText(f"{len(entries)} entries")
+
+        if not entries:
+            self.history_text.setHtml(
+                '<div style="color: #888; text-align: center; margin-top: 50px;">'
+                'No history entries yet.<br>Start detecting questions to build history.</div>'
+            )
+            return
+
+        # Show newest first
+        for entry in reversed(entries):
+            ts = entry.get("timestamp", "")
+            q = entry.get("question", "")
+            a = entry.get("answer", "")
+            lang = entry.get("language", "")
+            topic = entry.get("topic", "")
+
+            # Format timestamp
+            try:
+                dt = datetime.fromisoformat(ts)
+                ts_fmt = dt.strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                ts_fmt = ts
+
+            meta = f"<span style='color:#888;font-size:11px;'>{ts_fmt}"
+            if lang:
+                meta += f" | {lang}"
+            if topic:
+                meta += f" | {topic}"
+            meta += "</span>"
+
+            self.history_text.append(
+                f'{meta}<br>'
+                f'<div style="background-color:#1a3a5c;padding:8px;margin:3px 0;border-radius:4px;">'
+                f'<b style="color:#64b5f6;">Q:</b> '
+                f'<span style="color:#e0e0e0;">{q}</span></div>'
+                f'<div style="background-color:#1b4332;padding:8px;margin:3px 0;border-radius:4px;">'
+                f'<b style="color:#81c784;">A:</b> '
+                f'<span style="color:#e0e0e0;">{a}</span></div>'
+                f'<hr style="border-color:#333;">'
+            )
+
+    def filter_history(self, text):
+        """Filter history entries by search text"""
+        if not text:
+            self.display_entries(self.all_entries)
+            return
+        text_lower = text.lower()
+        filtered = [
+            e for e in self.all_entries
+            if text_lower in e.get("question", "").lower()
+            or text_lower in e.get("answer", "").lower()
+            or text_lower in e.get("topic", "").lower()
+        ]
+        self.display_entries(filtered)
+
+    def clear_history(self):
+        """Clear all history after confirmation"""
+        reply = QMessageBox.question(
+            self, "Clear History",
+            "Are you sure you want to delete all history?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            try:
+                with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+                    json.dump([], f)
+            except Exception:
+                pass
+            self.load_history()
 
 
 # ═══════════════════════════════════════════════════════════════

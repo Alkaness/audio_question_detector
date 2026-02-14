@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Audio Question Detector — GUI Application
+Cross-platform: auto-detects Linux/Windows for hotkeys, audio sources, and stealth.
 Multi-window architecture: Config → Test Mode / Overlay Mode
 """
 
@@ -23,15 +24,39 @@ import numpy as np
 from dotenv import load_dotenv
 from groq import Groq
 import logging
+import platform
 
-# Global hotkey via evdev (works on Wayland)
-try:
-    import evdev
-    from evdev import ecodes
-    EVDEV_AVAILABLE = True
-except ImportError:
-    EVDEV_AVAILABLE = False
-    print("Warning: evdev not installed. Overlay hotkeys disabled. Install with: pip install evdev")
+IS_WINDOWS = platform.system() == 'Windows'
+IS_LINUX = platform.system() == 'Linux'
+
+# Platform-specific hotkey backend
+EVDEV_AVAILABLE = False
+PYNPUT_AVAILABLE = False
+WIN32_AVAILABLE = False
+
+if IS_LINUX:
+    try:
+        import evdev
+        from evdev import ecodes
+        EVDEV_AVAILABLE = True
+    except ImportError:
+        print("Warning: evdev not installed. Hotkeys disabled. Install: pip install evdev")
+else:
+    try:
+        from pynput import keyboard as pynput_keyboard
+        PYNPUT_AVAILABLE = True
+    except ImportError:
+        print("Warning: pynput not installed. Hotkeys disabled. Install: pip install pynput")
+
+# Windows screen capture exclusion API
+if IS_WINDOWS:
+    import ctypes
+    try:
+        user32 = ctypes.windll.user32
+        WDA_EXCLUDEFROMCAPTURE = 0x00000011
+        WIN32_AVAILABLE = True
+    except AttributeError:
+        pass
 
 # Load env
 load_dotenv()
@@ -312,11 +337,11 @@ class AudioDetectorWorker:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Hotkey Manager (pynput-based global hotkeys)
+# Hotkey Manager (cross-platform: evdev on Linux, pynput on Windows)
 # ═══════════════════════════════════════════════════════════════
 
 class HotkeyManager:
-    """Global hotkey manager via evdev (double-press detection)"""
+    """Global hotkey manager with double-press detection (cross-platform)"""
 
     def __init__(self):
         self.last_f1_time = 0.0
@@ -327,9 +352,11 @@ class HotkeyManager:
         self.on_double_f3 = None
         self._thread = None
         self._running = False
+        self._listener = None  # pynput listener (Windows)
 
+    # ── Linux (evdev) ──
     def _find_keyboards(self):
-        """Find keyboards in /dev/input/"""
+        """Find keyboards in /dev/input/ (Linux only)"""
         keyboards = []
         try:
             for path in evdev.list_devices():
@@ -337,79 +364,106 @@ class HotkeyManager:
                 caps = device.capabilities(verbose=False)
                 if ecodes.EV_KEY in caps:
                     key_caps = caps[ecodes.EV_KEY]
-                    # Check that device has F1 and F2 keys
                     if ecodes.KEY_F1 in key_caps and ecodes.KEY_F2 in key_caps:
                         keyboards.append(device)
         except Exception:
             pass
         return keyboards
 
-    def _listen_loop(self):
-        """Main keyboard listener loop"""
+    def _listen_loop_evdev(self):
+        """Main keyboard listener loop — Linux evdev"""
         keyboards = self._find_keyboards()
         if not keyboards:
             print("[HotkeyManager] No keyboards found. Add user to input group:", flush=True)
             print("  sudo usermod -aG input $USER", flush=True)
             print("  Then log out and log back in.", flush=True)
             return
-
         print(f"[HotkeyManager] Found {len(keyboards)} keyboards. F1x2=hide, F2x2=show, F3x2=quit", flush=True)
-
-        # Listen on all keyboards via select
         import select as sel
         while self._running:
             try:
                 r, _, _ = sel.select(keyboards, [], [], 0.1)
                 for device in r:
                     for event in device.read():
-                        if event.type == ecodes.EV_KEY and event.value == 1:  # key down
-                            self._handle_key(event.code)
+                        if event.type == ecodes.EV_KEY and event.value == 1:
+                            self._handle_key_evdev(event.code)
             except Exception:
                 continue
 
-    def _handle_key(self, code):
-        """Handle key press"""
+    def _handle_key_evdev(self, code):
+        """Handle evdev key press (Linux)"""
         now = time.time()
         if code == ecodes.KEY_F1:
             if now - self.last_f1_time < 0.4:
-                if self.on_double_f1:
-                    self.on_double_f1()
+                if self.on_double_f1: self.on_double_f1()
                 self.last_f1_time = 0.0
-            else:
-                self.last_f1_time = now
+            else: self.last_f1_time = now
         elif code == ecodes.KEY_F2:
             if now - self.last_f2_time < 0.4:
-                if self.on_double_f2:
-                    self.on_double_f2()
+                if self.on_double_f2: self.on_double_f2()
                 self.last_f2_time = 0.0
-            else:
-                self.last_f2_time = now
+            else: self.last_f2_time = now
         elif code == ecodes.KEY_F3:
             if now - self.last_f3_time < 0.4:
-                if self.on_double_f3:
-                    self.on_double_f3()
+                if self.on_double_f3: self.on_double_f3()
                 self.last_f3_time = 0.0
-            else:
-                self.last_f3_time = now
+            else: self.last_f3_time = now
 
+    # ── Windows (pynput) ──
+    def _on_key_press_pynput(self, key):
+        """Handle pynput key press (Windows)"""
+        now = time.time()
+        try:
+            if key == pynput_keyboard.Key.f1:
+                if now - self.last_f1_time < 0.4:
+                    if self.on_double_f1: self.on_double_f1()
+                    self.last_f1_time = 0.0
+                else: self.last_f1_time = now
+            elif key == pynput_keyboard.Key.f2:
+                if now - self.last_f2_time < 0.4:
+                    if self.on_double_f2: self.on_double_f2()
+                    self.last_f2_time = 0.0
+                else: self.last_f2_time = now
+            elif key == pynput_keyboard.Key.f3:
+                if now - self.last_f3_time < 0.4:
+                    if self.on_double_f3: self.on_double_f3()
+                    self.last_f3_time = 0.0
+                else: self.last_f3_time = now
+        except AttributeError:
+            pass
+
+    # ── Cross-platform start/stop ──
     def start(self):
-        if not EVDEV_AVAILABLE:
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._listen_loop, daemon=True)
-        self._thread.start()
+        if IS_LINUX and EVDEV_AVAILABLE:
+            self._running = True
+            self._thread = threading.Thread(target=self._listen_loop_evdev, daemon=True)
+            self._thread.start()
+        elif IS_WINDOWS and PYNPUT_AVAILABLE:
+            self._listener = pynput_keyboard.Listener(on_press=self._on_key_press_pynput)
+            self._listener.daemon = True
+            self._listener.start()
+            print("[HotkeyManager] pynput listener started. F1x2=hide, F2x2=show, F3x2=quit", flush=True)
 
     def stop(self):
         self._running = False
+        if self._listener:
+            self._listener.stop()
+            self._listener = None
         self._thread = None
 
 
 # ═══════════════════════════════════════════════════════════════
-# Helper: get audio sources via pactl
+# Helper: get audio sources (pactl on Linux, sounddevice on Windows)
 # ═══════════════════════════════════════════════════════════════
 
 def get_audio_sources():
-    """Get list of audio sources"""
+    """Get list of audio sources — cross-platform"""
+    if IS_WINDOWS:
+        return _get_audio_sources_windows()
+    return _get_audio_sources_linux()
+
+def _get_audio_sources_linux():
+    """Linux: get sources via pactl"""
     monitor_devices = []
     input_devices = []
     try:
@@ -434,6 +488,22 @@ def get_audio_sources():
     except Exception:
         pass
     return monitor_devices + input_devices
+
+def _get_audio_sources_windows():
+    """Windows: get sources via sounddevice"""
+    devices = []
+    try:
+        for i, dev in enumerate(sd.query_devices()):
+            if dev['max_input_channels'] > 0:
+                name = dev['name']
+                # Prefer loopback/stereo mix for system audio
+                if any(kw in name.lower() for kw in ['stereo mix', 'loopback', 'what u hear']):
+                    devices.insert(0, (f"System Audio ({name})", i))
+                else:
+                    devices.append((name, i))
+    except Exception:
+        pass
+    return devices
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -571,14 +641,18 @@ class ConfigWindow(QMainWindow):
                                 "Add key to .env file:\nGROQ_API_KEY=your_key")
             return None
 
-        # Set as default source
-        try:
-            subprocess.run(['pactl', 'set-default-source', source_name], check=True)
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to set audio source:\n{e}")
-            return None
+        if IS_LINUX:
+            # Linux: set as default source via pactl, use default device
+            try:
+                subprocess.run(['pactl', 'set-default-source', source_name], check=True)
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to set audio source:\n{e}")
+                return None
+            device_index = None  # use default input after pactl set
+        else:
+            # Windows: source_name is already a sounddevice index (int)
+            device_index = source_name
 
-        device_index = None
         try:
             device_info = sd.query_devices(device_index, 'input')
             sample_rate = int(device_info['default_samplerate'])
@@ -824,24 +898,40 @@ class OverlayWindow(QWidget):
         layout.addWidget(self.text_display)
 
     def setup_stealth(self):
-        """Stealth mode via Qt window flags (works on both Wayland and X11).
-
-        Qt.Tool — hides from taskbar
-        Qt.FramelessWindowHint — no title bar or borders
-        Qt.WindowTransparentForInput — clicks pass through
-        Qt.WindowStaysOnTopHint — always on top
-        WA_TranslucentBackground — transparent background
-
-        Note: On Linux there is no API to exclude a window from screen capture.
-        Use 'Share a window' (not full screen) in Google Meet as a workaround.
+        """Platform-aware stealth mode.
+        Linux: Qt window flags only (no API to exclude from screen capture).
+        Windows: SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE).
         """
-        print("[Stealth] Qt window flags applied (Tool + Frameless + TransparentForInput)")
-        print("[Stealth] ⚠ Overlay IS visible in screen sharing on Linux.")
-        print("[Stealth] Workaround: share a specific window in Google Meet, not the entire screen.")
+        if IS_WINDOWS:
+            QTimer.singleShot(500, self._apply_win32_stealth)
+        else:
+            print("[Stealth] Qt window flags applied (Tool + Frameless + TransparentForInput)")
+            print("[Stealth] ⚠ Overlay IS visible in screen sharing on Linux.")
+            print("[Stealth] Workaround: share a specific window, not the entire screen.")
+
+    def _apply_win32_stealth(self):
+        """Windows: SetWindowDisplayAffinity to exclude from screen capture."""
+        if not WIN32_AVAILABLE:
+            print("[Stealth] Win32 API not available")
+            return
+        try:
+            hwnd = int(self.winId())
+            result = user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+            if result:
+                print("[Stealth] SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) — overlay invisible to capture")
+            else:
+                WDA_MONITOR = 0x00000001
+                result = user32.SetWindowDisplayAffinity(hwnd, WDA_MONITOR)
+                if result:
+                    print("[Stealth] SetWindowDisplayAffinity(WDA_MONITOR) — overlay shows black in capture")
+                else:
+                    print(f"[Stealth] SetWindowDisplayAffinity failed")
+        except Exception as e:
+            print(f"[Stealth] Win32 stealth error: {e}")
 
     def setup_hotkeys(self):
         """Set up global hotkeys"""
-        if not EVDEV_AVAILABLE:
+        if not (EVDEV_AVAILABLE or PYNPUT_AVAILABLE):
             return
         self.hotkey_manager = HotkeyManager()
         self.hotkey_manager.on_double_f1 = self._request_hide

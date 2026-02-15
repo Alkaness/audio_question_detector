@@ -11,20 +11,20 @@ from io import BytesIO
 from datetime import datetime
 from pathlib import Path
 import logging
+import requests  # For auto-update check
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QComboBox,
                              QTextEdit, QGroupBox, QMessageBox, QDesktopWidget,
-                             QLineEdit, QDialog, QScrollArea)
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt5.QtGui import QFont, QTextCursor, QColor, QPalette
+                             QLineEdit, QDialog, QScrollArea, QCheckBox,
+                             QRubberBand)
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPoint, QRect, QSize, QUrl
+from PyQt5.QtGui import QFont, QTextCursor, QColor, QPalette, QPainter, QPen, QDesktopServices
 
 import sounddevice as sd
 import numpy as np
 from dotenv import load_dotenv
 from groq import Groq
-import logging
-import platform
 
 IS_WINDOWS = platform.system() == 'Windows'
 IS_LINUX = platform.system() == 'Linux'
@@ -78,8 +78,40 @@ try:
 except ImportError:
     pass  # Falls back to RMS-based VAD
 
-# History file path
+# History and config file paths
 HISTORY_FILE = Path.home() / ".audio_detector_history.json"
+CONFIG_FILE = Path.home() / ".audio_detector_config.json"
+APP_VERSION = "1.3.0"
+GITHUB_REPO = "Alkaness/audio_question_detector"
+
+
+def load_config():
+    """Load saved settings from config file."""
+    defaults = {
+        "language": "Ukrainian",
+        "topic": "",
+        "font_size": 16,
+        "theme": "dark",
+        "overlay_geometry": None,  # None = fullscreen
+        "source_name": None,
+    }
+    try:
+        if CONFIG_FILE.exists():
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                saved = json.load(f)
+            defaults.update(saved)
+    except Exception:
+        pass
+    return defaults
+
+
+def save_config(config):
+    """Save settings to config file."""
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 # Load env
 load_dotenv()
@@ -250,7 +282,9 @@ class AudioDetectorWorker:
                 f"Give concise, clear answers (2-3 sentences maximum). "
                 f"If the question is about technology/programming, you may include a code example. "
                 f"Explain in simple terms so the person can quickly understand and respond in conversation. "
-                f"Take into account the context of previous questions and answers in the conversation."
+                f"Take into account the context of previous questions and answers in the conversation. "
+                f"At the very end of your response, on a new line, add a confidence tag like [CONF:85] "
+                f"where the number is your percentage confidence (0-100) in the accuracy of your answer."
             )
             messages = [{"role": "system", "content": system_prompt}]
             for prev_q, prev_a in self.conversation_history[-10:]:
@@ -258,6 +292,7 @@ class AudioDetectorWorker:
                 messages.append({"role": "assistant", "content": prev_a})
             messages.append({"role": "user", "content": question})
 
+            # Non-streaming response
             chat_completion = self.client.chat.completions.create(
                 messages=messages,
                 model="llama-3.3-70b-versatile",
@@ -266,6 +301,25 @@ class AudioDetectorWorker:
                 top_p=0.9
             )
             answer = chat_completion.choices[0].message.content.strip()
+
+            # Extract confidence score
+            import re
+            conf_match = re.search(r'\[CONF:(\d+)\]', answer)
+            confidence = None
+            if conf_match:
+                confidence = int(conf_match.group(1))
+                answer = re.sub(r'\s*\[CONF:\d+\]\s*', '', answer).strip()
+
+            # Add confidence badge
+            if confidence is not None:
+                if confidence >= 80:
+                    badge = f"🟢 {confidence}%"
+                elif confidence >= 50:
+                    badge = f"🟡 {confidence}%"
+                else:
+                    badge = f"🔴 {confidence}% ⚠️"
+                answer = f"{answer}\n\n[Confidence: {badge}]"
+
             self.conversation_history.append((question, answer))
             if len(self.conversation_history) > 10:
                 self.conversation_history = self.conversation_history[-10:]
@@ -438,14 +492,14 @@ class HotkeyManager:
         self.last_f2_time = 0.0
         self.last_f3_time = 0.0
         self.last_f4_time = 0.0
-        self.last_f5_time = 0.0
-        self.last_f6_time = 0.0
+        self.last_f9_time = 0.0
+        self.last_f10_time = 0.0
         self.on_double_f1 = None
         self.on_double_f2 = None
         self.on_double_f3 = None
         self.on_double_f4 = None  # Copy to clipboard
-        self.on_double_f5 = None  # Font size up
-        self.on_double_f6 = None  # Font size down
+        self.on_double_f9 = None  # Font size up
+        self.on_double_f10 = None  # Font size down
         self._thread = None
         self._running = False
         self._listener = None  # pynput listener (Windows/macOS)
@@ -509,16 +563,16 @@ class HotkeyManager:
                 if self.on_double_f4: self.on_double_f4()
                 self.last_f4_time = 0.0
             else: self.last_f4_time = now
-        elif code == ecodes.KEY_F5:
-            if now - self.last_f5_time < 0.4:
-                if self.on_double_f5: self.on_double_f5()
-                self.last_f5_time = 0.0
-            else: self.last_f5_time = now
-        elif code == ecodes.KEY_F6:
-            if now - self.last_f6_time < 0.4:
-                if self.on_double_f6: self.on_double_f6()
-                self.last_f6_time = 0.0
-            else: self.last_f6_time = now
+        elif code == ecodes.KEY_F9:
+            if now - self.last_f9_time < 0.4:
+                if self.on_double_f9: self.on_double_f9()
+                self.last_f9_time = 0.0
+            else: self.last_f9_time = now
+        elif code == ecodes.KEY_F10:
+            if now - self.last_f10_time < 0.4:
+                if self.on_double_f10: self.on_double_f10()
+                self.last_f10_time = 0.0
+            else: self.last_f10_time = now
 
     # ── Windows (pynput) ──
     def _on_key_press_pynput(self, key):
@@ -545,16 +599,16 @@ class HotkeyManager:
                     if self.on_double_f4: self.on_double_f4()
                     self.last_f4_time = 0.0
                 else: self.last_f4_time = now
-            elif key == pynput_keyboard.Key.f5:
-                if now - self.last_f5_time < 0.4:
-                    if self.on_double_f5: self.on_double_f5()
-                    self.last_f5_time = 0.0
-                else: self.last_f5_time = now
-            elif key == pynput_keyboard.Key.f6:
-                if now - self.last_f6_time < 0.4:
-                    if self.on_double_f6: self.on_double_f6()
-                    self.last_f6_time = 0.0
-                else: self.last_f6_time = now
+            elif key == pynput_keyboard.Key.f9:
+                if now - self.last_f9_time < 0.4:
+                    if self.on_double_f9: self.on_double_f9()
+                    self.last_f9_time = 0.0
+                else: self.last_f9_time = now
+            elif key == pynput_keyboard.Key.f10:
+                if now - self.last_f10_time < 0.4:
+                    if self.on_double_f10: self.on_double_f10()
+                    self.last_f10_time = 0.0
+                else: self.last_f10_time = now
         except AttributeError:
             pass
 
@@ -568,7 +622,7 @@ class HotkeyManager:
             self._listener = pynput_keyboard.Listener(on_press=self._on_key_press_pynput)
             self._listener.daemon = True
             self._listener.start()
-            print("[HotkeyManager] pynput listener started. F1-F6 hotkeys active", flush=True)
+            print("[HotkeyManager] pynput listener started. F1-F4, F9-F10 hotkeys active", flush=True)
 
     def stop(self):
         self._running = False
@@ -633,17 +687,67 @@ def _get_audio_sources_windows():
 
 
 # ═══════════════════════════════════════════════════════════════
-# Window 1: Configuration Window (Launcher)
+# Window 1: Configuration (Entry Point)
 # ═══════════════════════════════════════════════════════════════
 
-class ConfigWindow(QMainWindow):
+class AreaSelectionWindow(QWidget):
+    """Transparent overlay for selecting screen area"""
+    def __init__(self, parent=None):
+        super().__init__()
+        self.parent_config = parent
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setWindowState(Qt.WindowFullScreen)
+        self.setCursor(Qt.CrossCursor)
+        self.rubberband = QRubberBand(QRubberBand.Rectangle, self)
+        self.origin = QPoint()
+        self.setGeometry(QDesktopWidget().screenGeometry())
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 100))  # Dim background
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.origin = event.pos()
+            self.rubberband.setGeometry(QRect(self.origin, QSize()))
+            self.rubberband.show()
+        elif event.button() == Qt.RightButton or event.key() == Qt.Key_Escape:
+            self.close()
+            self.parent_config.show()
+
+    def mouseMoveEvent(self, event):
+        if not self.origin.isNull():
+            self.rubberband.setGeometry(QRect(self.origin, event.pos()).normalized())
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            rect = self.rubberband.geometry()
+            self.close()
+            # Save geometry to config
+            self.parent_config.config["overlay_geometry"] = [rect.x(), rect.y(), rect.width(), rect.height()]
+            save_config(self.parent_config.config)
+            QMessageBox.information(self.parent_config, "Area Set", 
+                "Overlay area updated.\nStart Overlay Mode to see changes.")
+            self.parent_config.show()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+            self.parent_config.show()
+
+class ConfigWindow(QWidget):
     """Configuration window — application entry point"""
 
     def __init__(self):
         super().__init__()
+        self.config = load_config()
+        self.audio_sources = get_audio_sources()
         self.test_window = None
         self.overlay_window = None
+        self.history_window = None
         self.init_ui()
+        self.check_for_updates()
 
     def init_ui(self):
         self.setWindowTitle("Audio Question Detector — Settings")
@@ -655,64 +759,32 @@ class ConfigWindow(QMainWindow):
         y = (screen.height() - 480) // 2
         self.move(x, y)
 
-        # Style — dark grey background
-        self.setStyleSheet("""
-            QMainWindow { background-color: #2d2d2d; }
-            QLabel { color: #e0e0e0; font-size: 14px; }
-            QComboBox {
-                background-color: #3a3a3a; color: #e0e0e0;
-                border: 1px solid #555; border-radius: 4px;
-                padding: 8px; font-size: 13px; min-height: 20px;
-            }
-            QComboBox::drop-down { border: none; }
-            QComboBox QAbstractItemView {
-                background-color: #3a3a3a; color: #e0e0e0;
-                selection-background-color: #4a90d9;
-            }
-            QPushButton {
-                font-size: 15px; font-weight: bold;
-                padding: 12px 30px; border-radius: 6px;
-                border: none;
-            }
-            QGroupBox {
-                color: #b0b0b0; border: 1px solid #444;
-                border-radius: 6px; margin-top: 10px; padding-top: 15px;
-                font-size: 13px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin; left: 10px; padding: 0 5px;
-            }
-        """)
-
-        central = QWidget()
-        self.setCentralWidget(central)
         layout = QVBoxLayout()
         layout.setSpacing(15)
-        layout.setContentsMargins(25, 20, 25, 25)
-        central.setLayout(layout)
+        layout.setContentsMargins(20, 20, 20, 20)
+        self.setLayout(layout)
 
         # Title
-        title = QLabel("Audio Question Detector")
-        title.setFont(QFont("Arial", 18, QFont.Bold))
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("color: #ffffff; margin-bottom: 5px;")
-        layout.addWidget(title)
+        title_label = QLabel(f"Audio Question Detector v{APP_VERSION}")
+        title_label.setFont(QFont("Arial", 16, QFont.Bold))
+        title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title_label)
 
-        # Settings group
-        settings_group = QGroupBox("Settings")
+        # Settings Group
+        settings_group = QGroupBox("Configuration")
         settings_layout = QVBoxLayout()
-        settings_layout.setSpacing(12)
+        settings_layout.setSpacing(10)
 
-        # Audio source
+        # Audio Source
         source_layout = QHBoxLayout()
-        source_label = QLabel("Source:")
-        source_label.setFixedWidth(80)
+        source_label = QLabel("Audio Source:")
+        source_label.setFixedWidth(100)
         source_layout.addWidget(source_label)
         self.source_combo = QComboBox()
         source_layout.addWidget(self.source_combo)
-        refresh_btn = QPushButton("🔄")
-        refresh_btn.setFixedWidth(40)
-        refresh_btn.setStyleSheet("background-color: #3a3a3a; color: #e0e0e0; padding: 8px;")
+        refresh_btn = QPushButton("↻")
+        refresh_btn.setFixedSize(30, 30)
+        refresh_btn.setToolTip("Refresh devices")
         refresh_btn.clicked.connect(self.refresh_sources)
         source_layout.addWidget(refresh_btn)
         settings_layout.addLayout(source_layout)
@@ -720,7 +792,7 @@ class ConfigWindow(QMainWindow):
         # Mode
         mode_layout = QHBoxLayout()
         mode_label = QLabel("Mode:")
-        mode_label.setFixedWidth(80)
+        mode_label.setFixedWidth(100)
         mode_layout.addWidget(mode_label)
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Test Mode", "Overlay Mode"])
@@ -730,30 +802,48 @@ class ConfigWindow(QMainWindow):
         # Language
         lang_layout = QHBoxLayout()
         lang_label = QLabel("Language:")
-        lang_label.setFixedWidth(80)
+        lang_label.setFixedWidth(100)
         lang_layout.addWidget(lang_label)
         self.lang_combo = QComboBox()
-        self.lang_combo.addItems([
+        langs = [
             "Ukrainian", "English", "Russian", "German",
             "French", "Spanish", "Polish", "Chinese", "Japanese"
-        ])
+        ]
+        self.lang_combo.addItems(langs)
+        # Load saved language
+        saved_lang = self.config.get("language", "Ukrainian")
+        if saved_lang in langs:
+            self.lang_combo.setCurrentText(saved_lang)
         lang_layout.addWidget(self.lang_combo)
         settings_layout.addLayout(lang_layout)
 
         # Topic context
         topic_layout = QHBoxLayout()
         topic_label = QLabel("Topic:")
-        topic_label.setFixedWidth(80)
+        topic_label.setFixedWidth(100)
         topic_layout.addWidget(topic_label)
         self.topic_input = QLineEdit()
-        self.topic_input.setPlaceholderText("e.g. Python backend interview, System design...")
-        self.topic_input.setStyleSheet(
-            "background-color: #3a3a3a; color: #e0e0e0; "
-            "border: 1px solid #555; border-radius: 4px; "
-            "padding: 8px; font-size: 13px;"
-        )
+        self.topic_input.setPlaceholderText("e.g. Python backend interview...")
+        self.topic_input.setText(self.config.get("topic", ""))
         topic_layout.addWidget(self.topic_input)
         settings_layout.addLayout(topic_layout)
+
+        # Theme & Overlay Area
+        extra_layout = QHBoxLayout()
+        
+        self.theme_check = QCheckBox("Light Theme")
+        self.theme_check.setChecked(self.config.get("theme") == "light")
+        self.theme_check.toggled.connect(self.toggle_theme)
+        extra_layout.addWidget(self.theme_check)
+        
+        extra_layout.addStretch()
+        
+        self.area_btn = QPushButton("📐 Set Overlay Area")
+        self.area_btn.setToolTip("Select custom screen area for overlay")
+        self.area_btn.clicked.connect(self.select_overlay_area)
+        extra_layout.addWidget(self.area_btn)
+        
+        settings_layout.addLayout(extra_layout)
 
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
@@ -761,31 +851,107 @@ class ConfigWindow(QMainWindow):
         layout.addStretch()
 
         # Launch button
-        self.start_btn = QPushButton("Start")
-        self.start_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50; color: white;
-            }
-            QPushButton:hover { background-color: #45a049; }
-        """)
+        self.start_btn = QPushButton("Start Detection")
+        self.start_btn.setFixedHeight(45)
+        self.start_btn.setFont(QFont("Arial", 12, QFont.Bold))
         self.start_btn.clicked.connect(self.launch_mode)
         layout.addWidget(self.start_btn)
 
-        # History button
-        self.history_btn = QPushButton("📜 View History")
-        self.history_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #37474f; color: #b0bec5;
-                font-size: 13px; padding: 8px 20px;
-                border-radius: 6px; border: none;
-            }
-            QPushButton:hover { background-color: #455a64; }
-        """)
+        # History and Info buttons
+        bottom_layout = QHBoxLayout()
+        self.history_btn = QPushButton("📜 History")
         self.history_btn.clicked.connect(self.show_history)
-        layout.addWidget(self.history_btn)
+        bottom_layout.addWidget(self.history_btn)
+        
+        self.github_btn = QPushButton("GitHub")
+        self.github_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(f"https://github.com/{GITHUB_REPO}")))
+        bottom_layout.addWidget(self.github_btn)
+        
+        layout.addLayout(bottom_layout)
 
         # Populate sources
         self.refresh_sources()
+        # Restore saved source if possible
+        saved_source = self.config.get("source_name")
+        if saved_source:
+             index = self.source_combo.findText(saved_source, Qt.MatchContains)
+             if index >= 0:
+                 self.source_combo.setCurrentIndex(index)
+
+    def apply_theme(self, theme):
+        """Apply dark or light theme"""
+        if theme == "light":
+            self.setStyleSheet("""
+                QWidget { background-color: #f0f0f0; color: #333; font-family: Arial; }
+                QGroupBox { border: 1px solid #ccc; margin-top: 10px; font-weight: bold; }
+                QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+                QLineEdit, QComboBox { 
+                    background-color: #fff; color: #333; 
+                    border: 1px solid #ccc; padding: 5px; border-radius: 4px; 
+                }
+                QPushButton { 
+                    background-color: #e0e0e0; border: 1px solid #ccc; 
+                    padding: 6px; border-radius: 4px; 
+                }
+                QPushButton:hover { background-color: #d0d0d0; }
+            """)
+            self.start_btn.setStyleSheet("background-color: #4CAF50; color: white; border: none; border-radius: 6px;")
+        else:
+            self.setStyleSheet("""
+                QWidget { background-color: #2b2b2b; color: #e0e0e0; font-family: Arial; }
+                QGroupBox { border: 1px solid #555; margin-top: 10px; font-weight: bold; }
+                QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+                QLineEdit, QComboBox { 
+                    background-color: #3a3a3a; color: #e0e0e0; 
+                    border: 1px solid #555; padding: 5px; border-radius: 4px; 
+                }
+                QPushButton { 
+                    background-color: #3a3a3a; border: none; 
+                    padding: 6px; border-radius: 4px; color: #e0e0e0;
+                }
+                QPushButton:hover { background-color: #454545; }
+            """)
+            self.start_btn.setStyleSheet("background-color: #4CAF50; color: white; border: none; border-radius: 6px;")
+
+    def toggle_theme(self, checked):
+        theme = "light" if checked else "dark"
+        self.config["theme"] = theme
+        save_config(self.config)
+        self.apply_theme(theme)
+
+    def select_overlay_area(self):
+        """Launch area selection overlay"""
+        self.hide()
+        self.area_selector = AreaSelectionWindow(self)
+        self.area_selector.show()
+
+    def check_for_updates(self):
+        """Check GitHub for newer version"""
+        def check():
+            try:
+                url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+                resp = requests.get(url, timeout=3)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    latest_tag = data.get("tag_name", "").lstrip("v")
+                    if latest_tag and latest_tag != APP_VERSION:
+                        self.update_available.emit(latest_tag)
+            except Exception:
+                pass
+        
+        # Simple threading to not block UI
+        threading.Thread(target=check, daemon=True).start()
+
+    # Signal for update (hacky way to run on main thread)
+    update_available = pyqtSignal(str)
+
+    def on_update_available(self, version):
+        QMessageBox.information(
+            self, "Update Available",
+            f"A new version ({version}) is available!\nCheck GitHub to download."
+        )
+
+
 
     def refresh_sources(self):
         self.source_combo.clear()
@@ -838,6 +1004,15 @@ class ConfigWindow(QMainWindow):
         language = self.lang_combo.currentText()
         topic = self.topic_input.text().strip()
 
+        # Save current settings
+        self.config.update({
+            "language": language,
+            "topic": topic,
+            "source_name": self.source_combo.currentText(),
+            "theme": "light" if self.theme_check.isChecked() else "dark"
+        })
+        save_config(self.config)
+
         self.hide()
 
         if mode == 0:
@@ -846,7 +1021,7 @@ class ConfigWindow(QMainWindow):
             self.test_window.show()
         else:
             # Overlay Mode
-            self.overlay_window = OverlayWindow(device_index, sample_rate, self, language, topic)
+            self.overlay_window = OverlayWindow(device_index, sample_rate, self, language, topic, self.config)
             self.overlay_window.show()
 
     def show_config(self):
@@ -1009,20 +1184,25 @@ class OverlayWindow(QWidget):
     sig_hide = pyqtSignal()
     sig_show = pyqtSignal()
 
-    def __init__(self, device_index, sample_rate, config_window, language="Ukrainian", topic=""):
+    def __init__(self, device_index, sample_rate, config_window, language="Ukrainian", topic="", config=None):
         super().__init__()
         self.config_window = config_window
         self.device_index = device_index
         self.sample_rate = sample_rate
         self.language = language
         self.topic = topic
+        self.config = config or {}
         self.worker = None
         self.worker_thread = None
         self.hotkey_manager = None
         self.is_silent = False
         self._pending_action = None  # 'hide', 'show', 'kill', 'copy', 'font_up', 'font_down'
         self.last_answer = ""  # For clipboard copy
-        self.overlay_font_size = 16  # Default font size for answers
+        self.overlay_font_size = self.config.get("font_size", 16)
+        
+        # Current answer being streamed
+        self.current_question = ""
+        self.current_answer = ""
 
         # Signals for thread-safe updates
         self.sig_hide.connect(self._go_silent)
@@ -1051,9 +1231,12 @@ class OverlayWindow(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowOpacity(0.85)
 
-        # Fullscreen
-        screen = QDesktopWidget().screenGeometry()
-        self.setGeometry(screen)
+        # Fullscreen or Custom Area
+        geometry = self.config.get("overlay_geometry")
+        if geometry:
+            self.setGeometry(QRect(*geometry))
+        else:
+            self.setGeometry(QDesktopWidget().screenGeometry())
 
         # Layout
         layout = QVBoxLayout()
@@ -1143,35 +1326,17 @@ class OverlayWindow(QWidget):
         self.hotkey_manager = HotkeyManager()
         self.hotkey_manager.on_double_f1 = self._request_hide
         self.hotkey_manager.on_double_f2 = self._request_show
-        self.hotkey_manager.on_double_f3 = self._request_kill
         self.hotkey_manager.on_double_f4 = self._request_copy
-        self.hotkey_manager.on_double_f5 = self._request_font_up
-        self.hotkey_manager.on_double_f6 = self._request_font_down
+        self.hotkey_manager.on_double_f9 = self._request_font_up
+        self.hotkey_manager.on_double_f10 = self._request_font_down
         self.hotkey_manager.start()
 
-    def _request_hide(self):
-        """Called from listener thread — safe via flag"""
-        self._pending_action = 'hide'
-
-    def _request_show(self):
-        """Called from listener thread — safe via flag"""
-        self._pending_action = 'show'
-
-    def _request_kill(self):
-        """Called from listener thread — terminate app"""
-        self._pending_action = 'kill'
-
-    def _request_copy(self):
-        """Called from listener thread — copy last answer"""
-        self._pending_action = 'copy'
-
-    def _request_font_up(self):
-        """Called from listener thread — increase font"""
-        self._pending_action = 'font_up'
-
-    def _request_font_down(self):
-        """Called from listener thread — decrease font"""
-        self._pending_action = 'font_down'
+    def _request_hide(self): self._pending_action = 'hide'
+    def _request_show(self): self._pending_action = 'show'
+    def _request_kill(self): self._pending_action = 'kill'
+    def _request_copy(self): self._pending_action = 'copy'
+    def _request_font_up(self): self._pending_action = 'font_up'
+    def _request_font_down(self): self._pending_action = 'font_down'
 
     def _poll_hotkey_action(self):
         """Check flag every 100ms (runs in GUI thread)"""
@@ -1232,7 +1397,11 @@ class OverlayWindow(QWidget):
 
     def _change_font_size(self, delta):
         """Change overlay answer font size by delta px"""
-        self.overlay_font_size = max(10, min(40, self.overlay_font_size + delta))
+        self.overlay_font_size = max(10, min(60, self.overlay_font_size + delta))
+        # Save to config
+        self.config["font_size"] = self.overlay_font_size
+        save_config(self.config)
+        
         # Brief visual feedback
         self.text_display.append(
             f'<div style="color: #b0bec5; font-size: 12px; text-align: center;">'
@@ -1244,19 +1413,20 @@ class OverlayWindow(QWidget):
         """Log in overlay — debug only, not shown"""
         pass  # Overlay shows only Q&A
 
+        self.text_display.moveCursor(QTextCursor.End)
+
     def add_qa(self, question, answer):
-        """Add answer to overlay"""
-        if self.is_silent:
-            return
+        """Add answer to overlay (non-streaming)"""
+        if self.is_silent: return
         self.last_answer = answer  # Store for clipboard copy
+        
         fs = self.overlay_font_size
         self.text_display.append(
-            f'<div style="margin-bottom: 15px;">'
+            f'<div style="margin-bottom: 5px; margin-top: 15px;">'
             f'<div style="color: #64b5f6; font-size: {fs - 2}px; margin-bottom: 5px;">'
             f'<b>Q:</b> {question}</div>'
             f'<div style="color: #e8f5e9; font-size: {fs}px; line-height: 1.5;">'
             f'<b>A:</b> {answer}</div>'
-            f'<hr style="border-color: #333;">'
             f'</div>'
         )
         self.text_display.moveCursor(QTextCursor.End)

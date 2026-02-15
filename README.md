@@ -60,7 +60,11 @@ pip install -r requirements.txt
 python3 audio_detector_gui.py
 ```
 
-Or use launchers: `./launch.sh` (Linux/macOS) or `launch.bat` (Windows).
+
+Or run the standalone executable:
+- **Linux**: `./dist/AudioQuestionDetector`
+- **Windows**: `dist\AudioQuestionDetector.exe`
+
 
 ## Usage
 
@@ -71,7 +75,10 @@ Or use launchers: `./launch.sh` (Linux/macOS) or `launch.bat` (Windows).
 | **Source** | Audio input device (system audio monitor or microphone) |
 | **Mode** | Test Mode (windowed) or Overlay Mode (transparent fullscreen) |
 | **Language** | Answer language (Ukrainian, English, Russian, German, French, Spanish, Polish, Chinese, Japanese) |
+| **Language** | Answer language (Ukrainian, English, Russian, German, French, Spanish, Polish, Chinese, Japanese) |
 | **Topic** | Context topic for better answers (e.g. "Python backend interview", "System design") |
+| **Theme** | **Dark** / **Light** mode toggle |
+| **Overlay Area** | **"Set Overlay Area"** button to define custom screen region |
 
 ### Overlay Hotkeys
 
@@ -81,8 +88,9 @@ Or use launchers: `./launch.sh` (Linux/macOS) or `launch.bat` (Windows).
 | F2 ×2 | Restore overlay |
 | F3 ×2 | Terminate the application |
 | F4 ×2 | Copy last answer to clipboard |
-| F5 ×2 | Increase font size |
-| F6 ×2 | Decrease font size |
+| F4 ×2 | Copy last answer to clipboard |
+| F9 ×2 | Increase font size |
+| F10 ×2 | Decrease font size |
 | Escape | Close overlay → Settings |
 
 ### Answer History
@@ -110,9 +118,14 @@ All Q&A pairs are automatically saved to `~/.audio_detector_history.json`. Acces
 - 🎯 Topic/keyword context for domain-specific answers
 - 💬 Conversation context memory (last 10 Q&A pairs)
 - 📋 Copy answers to clipboard (F4×2)
-- 🔤 Adjustable font size (F5×2 / F6×2)
+- 📋 Copy answers to clipboard (F4×2)
+- 🔤 Adjustable font size (F9×2 / F10×2)
 - 📜 Searchable answer history panel with JSON storage
-- ⌨️ Global hotkeys (F1-F6 double-press)
+- 💾 **Settings Persistence** — remembers preferences across restarts
+- 🟢 **Confidence Scores** — visual indicators of answer reliability
+- 🎨 **Light/Dark Themes** — visual customization
+- 🔄 **Auto-Update Checker** — notifies of new GitHub releases
+- ⌨️ Global hotkeys (F1-F4, F9-F10 double-press)
 
 ## Building Standalone Executable
 

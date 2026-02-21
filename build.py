@@ -26,6 +26,11 @@ HIDDEN_IMPORTS = [
     "PyQt5.QtGui",
     "styles",
     "modern_widgets",
+    "providers",
+    "providers.base",
+    "providers.groq_provider",
+    "providers.openai_provider",
+    "providers.ollama_provider",
 ]
 
 # Data files to include

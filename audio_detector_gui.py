@@ -23,7 +23,7 @@ from PyQt5.QtGui import QFont, QTextCursor, QColor, QPalette, QPainter, QPen, QD
 import sounddevice as sd
 import numpy as np
 from dotenv import load_dotenv
-from groq import Groq
+from providers import get_provider, PROVIDER_NAMES, TRANSCRIPTION_PROVIDERS, ANSWER_PROVIDERS
 from styles import COLORS, get_stylesheet, apply_theme_palette
 from modern_widgets import ModernButton, ModernInput, ModernToggle, ModernCard, ModernComboBox, ModernDialog
 
@@ -82,8 +82,19 @@ except ImportError:
 # History and config file paths
 HISTORY_FILE = Path.home() / ".audio_detector_history.json"
 CONFIG_FILE = Path.home() / ".audio_detector_config.json"
-APP_VERSION = "1.3.0"
+APP_VERSION = "2.0.0"
 GITHUB_REPO = "Alkaness/audio_question_detector"
+
+# Load API keys from .env
+load_dotenv()
+GROQ_API_KEY = os.getenv('GROQ_API_KEY', '')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
+
+API_KEYS = {
+    "groq": GROQ_API_KEY,
+    "openai": OPENAI_API_KEY,
+    "ollama": None,  # No API key needed
+}
 
 
 def load_config():
@@ -95,6 +106,8 @@ def load_config():
         "font_size": 16,
         "theme": "dark",
         "minimize_to_tray": True,
+        "transcription_provider": "groq",
+        "answer_provider": "groq",
         "overlay_geometry": None,  # None = fullscreen
         "source_name": None,
     }
@@ -116,11 +129,9 @@ def save_config(config):
     except Exception:
         pass
 
-# Load env
-load_dotenv()
+# Load env (providers already loaded keys above)
 
 # Settings
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SAMPLE_RATE = 16000
 CHANNELS = 1
 SILENCE_THRESHOLD = 0.01
@@ -169,14 +180,13 @@ class WorkerSignals(QObject):
 class AudioDetectorWorker:
     """Worker for audio processing in a separate thread"""
 
-    def __init__(self, device_index, signals, sample_rate=SAMPLE_RATE, language="Ukrainian", topic="", whisper_prompt=""):
+    def __init__(self, device_index, signals, sample_rate=SAMPLE_RATE, language="Ukrainian", topic="", whisper_prompt="", transcription_provider=None, answer_provider=None):
         self.device_index = device_index
         self.signals = signals
         self.sample_rate = sample_rate
         self.is_running = False
-        if not GROQ_API_KEY:
-            raise ValueError("GROQ_API_KEY is not set. Add it to .env file.")
-        self.client = Groq(api_key=GROQ_API_KEY)
+        self.transcription_provider = transcription_provider
+        self.answer_provider = answer_provider
         self.audio_queue = queue.Queue()
         self.last_transcription = ""
         self.conversation_history = []
@@ -223,14 +233,7 @@ class AudioDetectorWorker:
             if self.last_transcription:
                 prev_context = self.last_transcription[-200:]
                 prompt = prev_context + " " + self.whisper_prompt[:100]
-            transcription = self.client.audio.transcriptions.create(
-                file=wav_buffer,
-                model="whisper-large-v3",
-                response_format="text",
-                prompt=prompt,
-                temperature=0.0
-            )
-            result = transcription.strip() if transcription else ""
+            result = self.transcription_provider.transcribe(wav_buffer, prompt=prompt)
             if result:
                 self.last_transcription = result
             return result
@@ -309,22 +312,11 @@ class AudioDetectorWorker:
             # Signal UI to prepare answer block
             self.signals.answer_start.emit(question)
 
-            # Streaming response
-            stream = self.client.chat.completions.create(
-                messages=messages,
-                model="llama-3.3-70b-versatile",
-                temperature=0.7,
-                max_tokens=300,
-                top_p=0.9,
-                stream=True
-            )
-
+            # Streaming response via provider
             full_answer = ""
-            for chunk in stream:
-                token = chunk.choices[0].delta.content or ""
-                if token:
-                    full_answer += token
-                    self.signals.answer_token.emit(token)
+            for token in self.answer_provider.answer_stream(messages):
+                full_answer += token
+                self.signals.answer_token.emit(token)
 
             answer = full_answer.strip()
 
@@ -866,7 +858,42 @@ class ConfigWindow(QWidget):
         
         card_layout.addLayout(row2)
 
-        # 3. Topic
+        # 3. AI Provider Row
+        row3 = QHBoxLayout()
+
+        # Transcription Provider
+        tp_layout = QVBoxLayout()
+        tp_lbl = QLabel("Transcription")
+        tp_lbl.setObjectName("Subtitle")
+        tp_layout.addWidget(tp_lbl)
+        self.tp_combo = ModernComboBox(self.theme)
+        for key in TRANSCRIPTION_PROVIDERS:
+            self.tp_combo.addItem(PROVIDER_NAMES[key], key)
+        saved_tp = self.config.get("transcription_provider", "groq")
+        idx = self.tp_combo.findData(saved_tp)
+        if idx >= 0:
+            self.tp_combo.setCurrentIndex(idx)
+        tp_layout.addWidget(self.tp_combo)
+        row3.addLayout(tp_layout)
+
+        # Answer Provider
+        ap_layout = QVBoxLayout()
+        ap_lbl = QLabel("Answers")
+        ap_lbl.setObjectName("Subtitle")
+        ap_layout.addWidget(ap_lbl)
+        self.ap_combo = ModernComboBox(self.theme)
+        for key in ANSWER_PROVIDERS:
+            self.ap_combo.addItem(PROVIDER_NAMES[key], key)
+        saved_ap = self.config.get("answer_provider", "groq")
+        idx = self.ap_combo.findData(saved_ap)
+        if idx >= 0:
+            self.ap_combo.setCurrentIndex(idx)
+        ap_layout.addWidget(self.ap_combo)
+        row3.addLayout(ap_layout)
+
+        card_layout.addLayout(row3)
+
+        # 4. Topic
         lbl_topic = QLabel("Conversation Topic")
         lbl_topic.setObjectName("Subtitle")
         card_layout.addWidget(lbl_topic)
@@ -1000,11 +1027,7 @@ class ConfigWindow(QWidget):
             QMessageBox.warning(self, "Error", "Please select an audio source!")
             return None
 
-        if not GROQ_API_KEY or GROQ_API_KEY == "your_groq_api_key_here":
-            QMessageBox.warning(self, "Error",
-                                "Groq API key not configured!\n\n"
-                                "Add key to .env file:\nGROQ_API_KEY=your_key")
-            return None
+        # Provider validation is done later in launch_mode when providers are instantiated
 
         if IS_LINUX:
             # Linux: set as default source via pactl, use default device
@@ -1038,24 +1061,40 @@ class ConfigWindow(QWidget):
         whisper_prompt = self.whisper_input.text().strip()
 
         # Save current settings
+        tp_key = self.tp_combo.currentData()
+        ap_key = self.ap_combo.currentData()
         self.config.update({
             "language": language,
             "topic": topic,
             "whisper_prompt": whisper_prompt,
             "source_name": self.source_combo.currentText(),
-            "theme": "light" if self.theme_toggle.isChecked() else "dark"
+            "theme": "light" if self.theme_toggle.isChecked() else "dark",
+            "transcription_provider": tp_key,
+            "answer_provider": ap_key,
         })
         save_config(self.config)
+
+        # Create provider instances
+        try:
+            tp = get_provider(tp_key, api_key=API_KEYS.get(tp_key))
+        except Exception as e:
+            ModernDialog("Provider Error", f"Transcription provider error:\n{e}", self.theme, self).exec_()
+            return
+        try:
+            ap = get_provider(ap_key, api_key=API_KEYS.get(ap_key))
+        except Exception as e:
+            ModernDialog("Provider Error", f"Answer provider error:\n{e}", self.theme, self).exec_()
+            return
 
         self.hide()
 
         if mode == 0:
             # Test Mode
-            self.test_window = TestModeWindow(device_index, sample_rate, self, language, topic, self.config.get("theme", "dark"), whisper_prompt)
+            self.test_window = TestModeWindow(device_index, sample_rate, self, language, topic, self.config.get("theme", "dark"), whisper_prompt, tp, ap)
             self.test_window.show()
         else:
             # Overlay Mode
-            self.overlay_window = OverlayWindow(device_index, sample_rate, self, language, topic, self.config)
+            self.overlay_window = OverlayWindow(device_index, sample_rate, self, language, topic, self.config, tp, ap)
             self.overlay_window.show()
 
     def show_config(self):
@@ -1184,7 +1223,7 @@ class ConfigWindow(QWidget):
 class TestModeWindow(QMainWindow):
     """Test Mode — standard window with log and answers"""
 
-    def __init__(self, device_index, sample_rate, config_window, language="Ukrainian", topic="", theme="dark", whisper_prompt=""):
+    def __init__(self, device_index, sample_rate, config_window, language="Ukrainian", topic="", theme="dark", whisper_prompt="", transcription_provider=None, answer_provider=None):
         super().__init__()
         self.config_window = config_window
         self.device_index = device_index
@@ -1193,6 +1232,8 @@ class TestModeWindow(QMainWindow):
         self.topic = topic
         self.theme = theme
         self.whisper_prompt = whisper_prompt
+        self.transcription_provider = transcription_provider
+        self.answer_provider = answer_provider
         self.worker = None
         self.worker_thread = None
         self.init_ui()
@@ -1347,7 +1388,7 @@ class TestModeWindow(QMainWindow):
         signals.answer_start.connect(self.on_answer_start)
         signals.answer_token.connect(self.on_answer_token)
         signals.answer_done.connect(self.on_answer_done)
-        self.worker = AudioDetectorWorker(self.device_index, signals, self.sample_rate, self.language, self.topic, self.whisper_prompt)
+        self.worker = AudioDetectorWorker(self.device_index, signals, self.sample_rate, self.language, self.topic, self.whisper_prompt, self.transcription_provider, self.answer_provider)
         self.worker_thread = threading.Thread(target=self.worker.run, daemon=True)
         self.worker_thread.start()
         self.log_message("Detection started!", "success")
@@ -1380,7 +1421,7 @@ class OverlayWindow(QWidget):
     sig_hide = pyqtSignal()
     sig_show = pyqtSignal()
 
-    def __init__(self, device_index, sample_rate, config_window, language="Ukrainian", topic="", config=None):
+    def __init__(self, device_index, sample_rate, config_window, language="Ukrainian", topic="", config=None, transcription_provider=None, answer_provider=None):
         super().__init__()
         self.config_window = config_window
         self.device_index = device_index
@@ -1388,6 +1429,8 @@ class OverlayWindow(QWidget):
         self.language = language
         self.topic = topic
         self.config = config or {}
+        self.transcription_provider = transcription_provider
+        self.answer_provider = answer_provider
         self.worker = None
         self.worker_thread = None
         self.hotkey_manager = None
@@ -1662,7 +1705,7 @@ class OverlayWindow(QWidget):
         signals.answer_start.connect(self.on_answer_start)
         signals.answer_token.connect(self.on_answer_token)
         signals.answer_done.connect(self.on_answer_done)
-        self.worker = AudioDetectorWorker(self.device_index, signals, self.sample_rate, self.language, self.topic, self.config.get("whisper_prompt", ""))
+        self.worker = AudioDetectorWorker(self.device_index, signals, self.sample_rate, self.language, self.topic, self.config.get("whisper_prompt", ""), self.transcription_provider, self.answer_provider)
         self.worker_thread = threading.Thread(target=self.worker.run, daemon=True)
         self.worker_thread.start()
 
@@ -1883,9 +1926,9 @@ def main():
     config = load_config()
     theme = config.get("theme", "dark")
     
-    # Validate API key early
-    if not GROQ_API_KEY or GROQ_API_KEY == "your_groq_api_key_here":
-        print("WARNING: GROQ_API_KEY not set. Create .env file with: GROQ_API_KEY=your_key")
+    # Validate API keys early
+    if not GROQ_API_KEY and not OPENAI_API_KEY:
+        print("WARNING: No API keys set. Create .env file with GROQ_API_KEY or OPENAI_API_KEY")
     
     # Apply global theme (Palette + Stylesheet)
     app.setStyle('Fusion') # Fusion provides good base for custom palette. Set BEFORE palette!

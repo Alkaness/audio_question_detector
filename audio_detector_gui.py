@@ -297,9 +297,7 @@ class AudioDetectorWorker:
                 f"Give concise, clear answers (2-3 sentences maximum). "
                 f"If the question is about technology/programming, you may include a code example. "
                 f"Explain in simple terms so the person can quickly understand and respond in conversation. "
-                f"Take into account the context of previous questions and answers in the conversation. "
-                f"At the very end of your response, on a new line, add a confidence tag like [CONF:85] "
-                f"where the number is your percentage confidence (0-100) in the accuracy of your answer."
+                f"Take into account the context of previous questions and answers in the conversation."
             )
             messages = [{"role": "system", "content": system_prompt}]
             for prev_q, prev_a in self.conversation_history[-10:]:
@@ -328,23 +326,6 @@ class AudioDetectorWorker:
                     self.signals.answer_token.emit(token)
 
             answer = full_answer.strip()
-
-            # Extract confidence score
-            conf_match = re.search(r'\[CONF:(\d+)\]', answer)
-            confidence = None
-            if conf_match:
-                confidence = int(conf_match.group(1))
-                answer = re.sub(r'\s*\[CONF:\d+\]\s*', '', answer).strip()
-
-            # Add confidence badge
-            if confidence is not None:
-                if confidence >= 80:
-                    badge = f"🟢 {confidence}%"
-                elif confidence >= 50:
-                    badge = f"🟡 {confidence}%"
-                else:
-                    badge = f"🔴 {confidence}% ⚠️"
-                answer = f"{answer}\n\n[Confidence: {badge}]"
 
             self.conversation_history.append((question, answer))
             if len(self.conversation_history) > 10:

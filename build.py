@@ -25,6 +25,8 @@ HIDDEN_IMPORTS = [
     "PyQt5.QtWidgets",
     "PyQt5.QtCore",
     "PyQt5.QtGui",
+    "styles",
+    "modern_widgets",
 ]
 
 # Data files to include

@@ -25,6 +25,8 @@ import sounddevice as sd
 import numpy as np
 from dotenv import load_dotenv
 from groq import Groq
+from styles import COLORS, get_stylesheet, apply_theme_palette
+from modern_widgets import ModernButton, ModernInput, ModernToggle, ModernCard, ModernComboBox, ModernDialog
 
 IS_WINDOWS = platform.system() == 'Windows'
 IS_LINUX = platform.system() == 'Linux'
@@ -90,6 +92,7 @@ def load_config():
     defaults = {
         "language": "Ukrainian",
         "topic": "",
+        "whisper_prompt": "",
         "font_size": 16,
         "theme": "dark",
         "overlay_geometry": None,  # None = fullscreen
@@ -129,8 +132,8 @@ SILENCE_DURATION = 0.6
 SILENCE_WINDOW = 0.05
 VAD_THRESHOLD = 0.008
 
-# Whisper prompt
-WHISPER_PROMPT = (
+# Whisper prompt (default — can be overridden in config)
+DEFAULT_WHISPER_PROMPT = (
     "Big Data, Python, JavaScript, TypeScript, React, Angular, Vue, Node.js, "
     "REST API, GraphQL, Docker, Kubernetes, DevOps, CI/CD, Git, GitHub, "
     "Machine Learning, Deep Learning, Neural Network, TensorFlow, PyTorch, "
@@ -164,7 +167,7 @@ class WorkerSignals(QObject):
 class AudioDetectorWorker:
     """Worker for audio processing in a separate thread"""
 
-    def __init__(self, device_index, signals, sample_rate=SAMPLE_RATE, language="Ukrainian", topic=""):
+    def __init__(self, device_index, signals, sample_rate=SAMPLE_RATE, language="Ukrainian", topic="", whisper_prompt=""):
         self.device_index = device_index
         self.signals = signals
         self.sample_rate = sample_rate
@@ -175,6 +178,7 @@ class AudioDetectorWorker:
         self.conversation_history = []
         self.language = language
         self.topic = topic
+        self.whisper_prompt = whisper_prompt.strip() if whisper_prompt else DEFAULT_WHISPER_PROMPT
 
         # WebRTC VAD (if available)
         self._vad = None
@@ -211,10 +215,10 @@ class AudioDetectorWorker:
         try:
             wav_buffer = self.save_audio_to_wav(audio_data, self.sample_rate)
             wav_buffer.name = "audio.wav"
-            prompt = WHISPER_PROMPT
+            prompt = self.whisper_prompt
             if self.last_transcription:
                 prev_context = self.last_transcription[-200:]
-                prompt = prev_context + " " + WHISPER_PROMPT[:100]
+                prompt = prev_context + " " + self.whisper_prompt[:100]
             transcription = self.client.audio.transcriptions.create(
                 file=wav_buffer,
                 model="whisper-large-v3",
@@ -638,9 +642,11 @@ class HotkeyManager:
 
 def get_audio_sources():
     """Get list of audio sources — cross-platform"""
-    if IS_WINDOWS:
+    if IS_LINUX:
+        return _get_audio_sources_linux()
+    else:
+        # Windows and macOS both use sounddevice
         return _get_audio_sources_windows()
-    return _get_audio_sources_linux()
 
 def _get_audio_sources_linux():
     """Linux: get sources via pactl"""
@@ -727,9 +733,12 @@ class AreaSelectionWindow(QWidget):
             # Save geometry to config
             self.parent_config.config["overlay_geometry"] = [rect.x(), rect.y(), rect.width(), rect.height()]
             save_config(self.parent_config.config)
-            QMessageBox.information(self.parent_config, "Area Set", 
-                "Overlay area updated.\nStart Overlay Mode to see changes.")
             self.parent_config.show()
+            ModernDialog(
+                "Area Set", 
+                "Overlay area updated.\nStart Overlay Mode to see changes.",
+                self.parent_config.theme, self.parent_config
+            ).exec_()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
@@ -751,127 +760,142 @@ class ConfigWindow(QWidget):
 
     def init_ui(self):
         self.setWindowTitle("Audio Question Detector — Settings")
-        self.setFixedSize(500, 480)
-
+        # self.setFixedSize(500, 550) # Removing fixed size to prevent overlap
+        self.setMinimumSize(500, 650) # Taller minimum size
+        self.theme = self.config.get("theme", "dark")
+        
         # Center on screen
         screen = QDesktopWidget().screenGeometry()
         x = (screen.width() - 500) // 2
-        y = (screen.height() - 480) // 2
+        y = (screen.height() - 650) // 2
         self.move(x, y)
+        
+        # Apply base stylesheet
+        self.setStyleSheet(get_stylesheet(self.theme))
 
-        layout = QVBoxLayout()
-        layout.setSpacing(15)
-        layout.setContentsMargins(20, 20, 20, 20)
-        self.setLayout(layout)
+        main_layout = QVBoxLayout()
+        main_layout.setSpacing(20)
+        main_layout.setContentsMargins(30, 30, 30, 30)
+        self.setLayout(main_layout)
 
-        # Title
-        title_label = QLabel(f"Audio Question Detector v{APP_VERSION}")
-        title_label.setFont(QFont("Arial", 16, QFont.Bold))
-        title_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(title_label)
+        # Header
+        header = QHBoxLayout()
+        title = QLabel(f"Audio Detector")
+        title.setObjectName("Title")
+        subtitle = QLabel(f"v{APP_VERSION}")
+        subtitle.setObjectName("Subtitle")
+        header.addWidget(title)
+        header.addWidget(subtitle)
+        header.addStretch()
+        
+        # Theme Toggle
+        self.theme_toggle = ModernToggle(self.theme)
+        self.theme_toggle.setChecked(self.theme == "light")
+        self.theme_toggle.stateChanged.connect(self.toggle_theme)
+        header.addWidget(self.theme_toggle)
+        
+        main_layout.addLayout(header)
 
-        # Settings Group
-        settings_group = QGroupBox("Configuration")
-        settings_layout = QVBoxLayout()
-        settings_layout.setSpacing(10)
+        # Settings Card
+        self.settings_card = ModernCard(self.theme)
+        card_layout = QVBoxLayout()
+        card_layout.setSpacing(15)
+        card_layout.setContentsMargins(20, 20, 20, 20)
+        self.settings_card.setLayout(card_layout)
 
-        # Audio Source
-        source_layout = QHBoxLayout()
-        source_label = QLabel("Audio Source:")
-        source_label.setFixedWidth(100)
-        source_layout.addWidget(source_label)
-        self.source_combo = QComboBox()
-        source_layout.addWidget(self.source_combo)
-        refresh_btn = QPushButton("↻")
-        refresh_btn.setFixedSize(30, 30)
-        refresh_btn.setToolTip("Refresh devices")
+        # 1. Device Selection
+        lbl = QLabel("Audio Source")
+        lbl.setObjectName("Subtitle")
+        card_layout.addWidget(lbl)
+        
+        source_row = QHBoxLayout()
+        self.source_combo = ModernComboBox(self.theme)
+        # self.source_combo.setFixedHeight(36) # Handled by widget
+        source_row.addWidget(self.source_combo)
+        
+        refresh_btn = ModernButton("↻", self.theme)
+        refresh_btn.setFixedWidth(40)
         refresh_btn.clicked.connect(self.refresh_sources)
-        source_layout.addWidget(refresh_btn)
-        settings_layout.addLayout(source_layout)
+        source_row.addWidget(refresh_btn)
+        card_layout.addLayout(source_row)
 
+        # 2. Mode & Language Row
+        row2 = QHBoxLayout()
+        
         # Mode
-        mode_layout = QHBoxLayout()
-        mode_label = QLabel("Mode:")
-        mode_label.setFixedWidth(100)
-        mode_layout.addWidget(mode_label)
-        self.mode_combo = QComboBox()
+        mode_layout = QVBoxLayout()
+        mode_lbl = QLabel("Mode")
+        mode_lbl.setObjectName("Subtitle")
+        mode_layout.addWidget(mode_lbl)
+        self.mode_combo = ModernComboBox(self.theme)
         self.mode_combo.addItems(["Test Mode", "Overlay Mode"])
         mode_layout.addWidget(self.mode_combo)
-        settings_layout.addLayout(mode_layout)
-
+        row2.addLayout(mode_layout)
+        
         # Language
-        lang_layout = QHBoxLayout()
-        lang_label = QLabel("Language:")
-        lang_label.setFixedWidth(100)
-        lang_layout.addWidget(lang_label)
-        self.lang_combo = QComboBox()
+        lang_layout = QVBoxLayout()
+        lang_lbl = QLabel("Language")
+        lang_lbl.setObjectName("Subtitle")
+        lang_layout.addWidget(lang_lbl)
+        self.lang_combo = ModernComboBox(self.theme)
         langs = [
             "Ukrainian", "English", "Russian", "German",
             "French", "Spanish", "Polish", "Chinese", "Japanese"
         ]
         self.lang_combo.addItems(langs)
-        # Load saved language
         saved_lang = self.config.get("language", "Ukrainian")
         if saved_lang in langs:
             self.lang_combo.setCurrentText(saved_lang)
         lang_layout.addWidget(self.lang_combo)
-        settings_layout.addLayout(lang_layout)
+        row2.addLayout(lang_layout)
+        
+        card_layout.addLayout(row2)
 
-        # Topic context
-        topic_layout = QHBoxLayout()
-        topic_label = QLabel("Topic:")
-        topic_label.setFixedWidth(100)
-        topic_layout.addWidget(topic_label)
-        self.topic_input = QLineEdit()
-        self.topic_input.setPlaceholderText("e.g. Python backend interview...")
+        # 3. Topic
+        lbl_topic = QLabel("Conversation Topic")
+        lbl_topic.setObjectName("Subtitle")
+        card_layout.addWidget(lbl_topic)
+        self.topic_input = ModernInput(self.theme)
+        self.topic_input.setPlaceholderText("e.g. System Design, React Interview...")
         self.topic_input.setText(self.config.get("topic", ""))
-        topic_layout.addWidget(self.topic_input)
-        settings_layout.addLayout(topic_layout)
+        card_layout.addWidget(self.topic_input)
 
-        # Theme & Overlay Area
-        extra_layout = QHBoxLayout()
-        
-        self.theme_check = QCheckBox("Light Theme")
-        self.theme_check.setChecked(self.config.get("theme") == "light")
-        self.theme_check.toggled.connect(self.toggle_theme)
-        extra_layout.addWidget(self.theme_check)
-        
-        extra_layout.addStretch()
-        
-        self.area_btn = QPushButton("📐 Set Overlay Area")
-        self.area_btn.setToolTip("Select custom screen area for overlay")
+        # 4. Whisper Prompt
+        lbl_whisper = QLabel("Whisper Prompt")
+        lbl_whisper.setObjectName("Subtitle")
+        card_layout.addWidget(lbl_whisper)
+        self.whisper_input = ModernInput(self.theme)
+        self.whisper_input.setPlaceholderText("Keywords to improve transcription accuracy...")
+        self.whisper_input.setText(self.config.get("whisper_prompt", ""))
+        card_layout.addWidget(self.whisper_input)
+
+        # 5. Overlay Area
+        self.area_btn = ModernButton("Set Overlay Area", self.theme)
         self.area_btn.clicked.connect(self.select_overlay_area)
-        extra_layout.addWidget(self.area_btn)
-        
-        settings_layout.addLayout(extra_layout)
+        card_layout.addWidget(self.area_btn)
 
-        settings_group.setLayout(settings_layout)
-        layout.addWidget(settings_group)
+        main_layout.addWidget(self.settings_card)
+        main_layout.addStretch()
 
-        layout.addStretch()
-
-        # Launch button
-        self.start_btn = QPushButton("Start Detection")
-        self.start_btn.setFixedHeight(45)
-        self.start_btn.setFont(QFont("Arial", 12, QFont.Bold))
+        # Action Buttons
+        self.start_btn = ModernButton("Start Detection", self.theme, accent=True)
+        self.start_btn.setFixedHeight(50)
         self.start_btn.clicked.connect(self.launch_mode)
-        layout.addWidget(self.start_btn)
-
-        # History and Info buttons
-        bottom_layout = QHBoxLayout()
-        self.history_btn = QPushButton("📜 History")
+        main_layout.addWidget(self.start_btn)
+        
+        bottom_row = QHBoxLayout()
+        self.history_btn = ModernButton("History", self.theme)
         self.history_btn.clicked.connect(self.show_history)
-        bottom_layout.addWidget(self.history_btn)
+        bottom_row.addWidget(self.history_btn)
         
-        self.github_btn = QPushButton("GitHub")
+        self.github_btn = ModernButton("GitHub", self.theme)
         self.github_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(f"https://github.com/{GITHUB_REPO}")))
-        bottom_layout.addWidget(self.github_btn)
+        bottom_row.addWidget(self.github_btn)
         
-        layout.addLayout(bottom_layout)
+        main_layout.addLayout(bottom_row)
 
         # Populate sources
         self.refresh_sources()
-        # Restore saved source if possible
         saved_source = self.config.get("source_name")
         if saved_source:
              index = self.source_combo.findText(saved_source, Qt.MatchContains)
@@ -879,41 +903,27 @@ class ConfigWindow(QWidget):
                  self.source_combo.setCurrentIndex(index)
 
     def apply_theme(self, theme):
-        """Apply dark or light theme"""
-        if theme == "light":
-            self.setStyleSheet("""
-                QWidget { background-color: #f0f0f0; color: #333; font-family: Arial; }
-                QGroupBox { border: 1px solid #ccc; margin-top: 10px; font-weight: bold; }
-                QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
-                QLineEdit, QComboBox { 
-                    background-color: #fff; color: #333; 
-                    border: 1px solid #ccc; padding: 5px; border-radius: 4px; 
-                }
-                QPushButton { 
-                    background-color: #e0e0e0; border: 1px solid #ccc; 
-                    padding: 6px; border-radius: 4px; 
-                }
-                QPushButton:hover { background-color: #d0d0d0; }
-            """)
-            self.start_btn.setStyleSheet("background-color: #4CAF50; color: white; border: none; border-radius: 6px;")
-        else:
-            self.setStyleSheet("""
-                QWidget { background-color: #2b2b2b; color: #e0e0e0; font-family: Arial; }
-                QGroupBox { border: 1px solid #555; margin-top: 10px; font-weight: bold; }
-                QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
-                QLineEdit, QComboBox { 
-                    background-color: #3a3a3a; color: #e0e0e0; 
-                    border: 1px solid #555; padding: 5px; border-radius: 4px; 
-                }
-                QPushButton { 
-                    background-color: #3a3a3a; border: none; 
-                    padding: 6px; border-radius: 4px; color: #e0e0e0;
-                }
-                QPushButton:hover { background-color: #454545; }
-            """)
-            self.start_btn.setStyleSheet("background-color: #4CAF50; color: white; border: none; border-radius: 6px;")
+        """Update theme for window and all modern widgets"""
+        self.theme = theme
 
-    def toggle_theme(self, checked):
+        # 1. Global palette + app-level stylesheet
+        apply_theme_palette(QApplication.instance(), theme)
+
+        # 2. Re-apply this window's own stylesheet so background/labels update
+        self.setStyleSheet(get_stylesheet(theme))
+
+        # 3. Walk every child that has a 'theme' attr and refresh it
+        for child in self.findChildren(QWidget):
+            if hasattr(child, "theme"):
+                child.theme = theme
+                if hasattr(child, "update_style"):
+                    child.update_style()
+                else:
+                    child.update()
+
+    def toggle_theme(self, state):
+        # State can be checked (2) or unchecked (0) if from stateChanged
+        checked = self.theme_toggle.isChecked()
         theme = "light" if checked else "dark"
         self.config["theme"] = theme
         save_config(self.config)
@@ -946,10 +956,11 @@ class ConfigWindow(QWidget):
     update_available = pyqtSignal(str)
 
     def on_update_available(self, version):
-        QMessageBox.information(
-            self, "Update Available",
-            f"A new version ({version}) is available!\nCheck GitHub to download."
-        )
+        ModernDialog(
+            "Update Available",
+            f"A new version ({version}) is available!\nCheck GitHub to download.",
+            self.theme, self
+        ).exec_()
 
 
 
@@ -983,7 +994,7 @@ class ConfigWindow(QWidget):
                 return None
             device_index = None  # use default input after pactl set
         else:
-            # Windows: source_name is already a sounddevice index (int)
+            # Windows and macOS: source_name is already a sounddevice index (int)
             device_index = source_name
 
         try:
@@ -1003,13 +1014,15 @@ class ConfigWindow(QWidget):
         mode = self.mode_combo.currentIndex()
         language = self.lang_combo.currentText()
         topic = self.topic_input.text().strip()
+        whisper_prompt = self.whisper_input.text().strip()
 
         # Save current settings
         self.config.update({
             "language": language,
             "topic": topic,
+            "whisper_prompt": whisper_prompt,
             "source_name": self.source_combo.currentText(),
-            "theme": "light" if self.theme_check.isChecked() else "dark"
+            "theme": "light" if self.theme_toggle.isChecked() else "dark"
         })
         save_config(self.config)
 
@@ -1017,7 +1030,7 @@ class ConfigWindow(QWidget):
 
         if mode == 0:
             # Test Mode
-            self.test_window = TestModeWindow(device_index, sample_rate, self, language, topic)
+            self.test_window = TestModeWindow(device_index, sample_rate, self, language, topic, self.config.get("theme", "dark"), whisper_prompt)
             self.test_window.show()
         else:
             # Overlay Mode
@@ -1031,10 +1044,10 @@ class ConfigWindow(QWidget):
         self.activateWindow()
 
     def show_history(self):
-        """Open history window"""
-        self.history_window = HistoryWindow(self)
+        """Open history window — always recreate to ensure fresh theme"""
+        self.history_window = HistoryWindow(self.theme, self)
         self.history_window.show()
-
+        self.history_window.raise_()
 
 # ═══════════════════════════════════════════════════════════════
 # Window 2: Test Mode (Standard Window)
@@ -1043,13 +1056,15 @@ class ConfigWindow(QWidget):
 class TestModeWindow(QMainWindow):
     """Test Mode — standard window with log and answers"""
 
-    def __init__(self, device_index, sample_rate, config_window, language="Ukrainian", topic=""):
+    def __init__(self, device_index, sample_rate, config_window, language="Ukrainian", topic="", theme="dark", whisper_prompt=""):
         super().__init__()
         self.config_window = config_window
         self.device_index = device_index
         self.sample_rate = sample_rate
         self.language = language
         self.topic = topic
+        self.theme = theme
+        self.whisper_prompt = whisper_prompt
         self.worker = None
         self.worker_thread = None
         self.init_ui()
@@ -1059,36 +1074,20 @@ class TestModeWindow(QMainWindow):
     def init_ui(self):
         self.setWindowTitle("Test Mode — Audio Question Detector")
         self.setGeometry(100, 100, 850, 650)
-
-        self.setStyleSheet("""
-            QMainWindow { background-color: #1e1e1e; }
-            QLabel { color: #e0e0e0; }
-            QTextEdit {
-                background-color: #252525; color: #d4d4d4;
-                border: 1px solid #3a3a3a; border-radius: 4px;
-                font-family: 'Consolas', 'Courier New', monospace; font-size: 12px;
-            }
-            QGroupBox {
-                color: #b0b0b0; border: 1px solid #3a3a3a;
-                border-radius: 6px; margin-top: 10px; padding-top: 15px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin; left: 10px; padding: 0 5px;
-            }
-        """)
+        
+        self.setStyleSheet(get_stylesheet(self.theme))
 
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout()
-        layout.setSpacing(10)
-        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
         central.setLayout(layout)
 
         # Header + status
         header = QHBoxLayout()
         title = QLabel("Test Mode")
-        title.setFont(QFont("Arial", 16, QFont.Bold))
-        title.setStyleSheet("color: #ffffff;")
+        title.setObjectName("Title")
         header.addWidget(title)
         header.addStretch()
 
@@ -1103,6 +1102,18 @@ class TestModeWindow(QMainWindow):
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumHeight(180)
+        # Apply specific style for log
+        c = COLORS[self.theme]
+        self.log_text.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: {c['input_bg']};
+                color: {c['text_primary']};
+                border: 1px solid {c['border']};
+                border-radius: 6px;
+                font-family: 'Consolas', 'Courier New', monospace; 
+                font-size: 12px;
+            }}
+        """)
         log_layout.addWidget(self.log_text)
         log_group.setLayout(log_layout)
         layout.addWidget(log_group)
@@ -1112,20 +1123,34 @@ class TestModeWindow(QMainWindow):
         qa_layout = QVBoxLayout()
         self.qa_text = QTextEdit()
         self.qa_text.setReadOnly(True)
-        self.qa_text.setStyleSheet(self.qa_text.styleSheet() + "font-size: 13px;")
+        self.qa_text.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: {c['input_bg']};
+                color: {c['text_primary']};
+                border: 1px solid {c['border']};
+                border-radius: 6px;
+                font-size: 13px;
+            }}
+        """)
         qa_layout.addWidget(self.qa_text)
         qa_group.setLayout(qa_layout)
         layout.addWidget(qa_group)
 
         # Stop button
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #f44336; color: white;
-                font-size: 15px; font-weight: bold;
-                padding: 12px 30px; border-radius: 6px; border: none;
-            }
-            QPushButton:hover { background-color: #e53935; }
+        # ModernButton with danger color
+        self.stop_btn = ModernButton("Stop", self.theme)
+        danger = COLORS[self.theme]['danger']
+        self.stop_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {danger};
+                color: white;
+                border: none;
+                border-radius: 8px;
+                font-weight: 600;
+                padding: 10px 30px;
+                font-size: 14px;
+            }}
+            QPushButton:hover {{ background-color: #d32f2f; }}
         """)
         self.stop_btn.clicked.connect(self.stop_and_return)
         layout.addWidget(self.stop_btn)
@@ -1137,13 +1162,17 @@ class TestModeWindow(QMainWindow):
         self.log_text.moveCursor(QTextCursor.End)
 
     def add_qa(self, question, answer):
+        c = COLORS[self.theme]
+        # Use theme-aware subtle backgrounds
+        q_bg = c['input_bg']
+        a_bg = c['card']
         self.qa_text.append(
-            f'<div style="background-color: #1a3a5c; padding: 10px; margin: 5px; border-radius: 6px;">'
-            f'<b style="color: #64b5f6;">TEXT:</b> <span style="color: #e0e0e0;">{question}</span></div>'
+            f'<div style="background-color: {q_bg}; padding: 10px; margin: 5px; border-radius: 6px; border: 1px solid {c["border"]};">' 
+            f'<b style="color: {c["accent"]};">TEXT:</b> <span style="color: {c["text_primary"]};">{question}</span></div>'
         )
         self.qa_text.append(
-            f'<div style="background-color: #1b4332; padding: 10px; margin: 5px; border-radius: 6px;">'
-            f'<b style="color: #81c784;">ANSWER:</b> <span style="color: #e0e0e0;">{answer}</span></div><br>'
+            f'<div style="background-color: {a_bg}; padding: 10px; margin: 5px; border-radius: 6px; border: 1px solid {c["border"]};">' 
+            f'<b style="color: {c["success"]};">ANSWER:</b> <span style="color: {c["text_primary"]};">{answer}</span></div><br>'
         )
         self.qa_text.moveCursor(QTextCursor.End)
 
@@ -1151,7 +1180,7 @@ class TestModeWindow(QMainWindow):
         signals = WorkerSignals()
         signals.log.connect(self.log_message)
         signals.question.connect(self.add_qa)
-        self.worker = AudioDetectorWorker(self.device_index, signals, self.sample_rate, self.language, self.topic)
+        self.worker = AudioDetectorWorker(self.device_index, signals, self.sample_rate, self.language, self.topic, self.whisper_prompt)
         self.worker_thread = threading.Thread(target=self.worker.run, daemon=True)
         self.worker_thread.start()
         self.log_message("Detection started!", "success")
@@ -1326,6 +1355,7 @@ class OverlayWindow(QWidget):
         self.hotkey_manager = HotkeyManager()
         self.hotkey_manager.on_double_f1 = self._request_hide
         self.hotkey_manager.on_double_f2 = self._request_show
+        self.hotkey_manager.on_double_f3 = self._request_kill
         self.hotkey_manager.on_double_f4 = self._request_copy
         self.hotkey_manager.on_double_f9 = self._request_font_up
         self.hotkey_manager.on_double_f10 = self._request_font_down
@@ -1382,15 +1412,14 @@ class OverlayWindow(QWidget):
         if self.last_answer:
             clipboard = QApplication.clipboard()
             clipboard.setText(self.last_answer)
-            # Brief visual feedback
             self.text_display.append(
-                '<div style="color: #ffd54f; font-size: 12px; text-align: center;">'
+                '<div style="color: #34C759; font-size: 12px; text-align: center;">'
                 '📋 Answer copied to clipboard</div>'
             )
             self.text_display.moveCursor(QTextCursor.End)
         else:
             self.text_display.append(
-                '<div style="color: #ff8a65; font-size: 12px; text-align: center;">'
+                '<div style="color: #FF453A; font-size: 12px; text-align: center;">'
                 'No answer to copy yet</div>'
             )
             self.text_display.moveCursor(QTextCursor.End)
@@ -1398,13 +1427,11 @@ class OverlayWindow(QWidget):
     def _change_font_size(self, delta):
         """Change overlay answer font size by delta px"""
         self.overlay_font_size = max(10, min(60, self.overlay_font_size + delta))
-        # Save to config
         self.config["font_size"] = self.overlay_font_size
         save_config(self.config)
         
-        # Brief visual feedback
         self.text_display.append(
-            f'<div style="color: #b0bec5; font-size: 12px; text-align: center;">'
+            f'<div style="color: #98989D; font-size: 12px; text-align: center;">'
             f'Font size: {self.overlay_font_size}px</div>'
         )
         self.text_display.moveCursor(QTextCursor.End)
@@ -1413,20 +1440,19 @@ class OverlayWindow(QWidget):
         """Log in overlay — debug only, not shown"""
         pass  # Overlay shows only Q&A
 
-        self.text_display.moveCursor(QTextCursor.End)
-
     def add_qa(self, question, answer):
         """Add answer to overlay (non-streaming)"""
         if self.is_silent: return
         self.last_answer = answer  # Store for clipboard copy
         
         fs = self.overlay_font_size
+        # Overlay always has dark background, so always use white/blue text
         self.text_display.append(
             f'<div style="margin-bottom: 5px; margin-top: 15px;">'
-            f'<div style="color: #64b5f6; font-size: {fs - 2}px; margin-bottom: 5px;">'
-            f'<b>Q:</b> {question}</div>'
-            f'<div style="color: #e8f5e9; font-size: {fs}px; line-height: 1.5;">'
-            f'<b>A:</b> {answer}</div>'
+            f'<div style="color: #0A84FF; font-size: {fs - 2}px; margin-bottom: 4px; font-weight: bold;">'
+            f'Q: {question}</div>'
+            f'<div style="color: #FFFFFF; font-size: {fs}px; line-height: 1.4;">'
+            f'A: {answer}</div>'
             f'</div>'
         )
         self.text_display.moveCursor(QTextCursor.End)
@@ -1435,7 +1461,7 @@ class OverlayWindow(QWidget):
         signals = WorkerSignals()
         signals.log.connect(self.log_message)
         signals.question.connect(self.add_qa)
-        self.worker = AudioDetectorWorker(self.device_index, signals, self.sample_rate, self.language, self.topic)
+        self.worker = AudioDetectorWorker(self.device_index, signals, self.sample_rate, self.language, self.topic, self.config.get("whisper_prompt", ""))
         self.worker_thread = threading.Thread(target=self.worker.run, daemon=True)
         self.worker_thread.start()
 
@@ -1473,53 +1499,34 @@ class OverlayWindow(QWidget):
 class HistoryWindow(QDialog):
     """Browsable Q&A history window with search and clear"""
 
-    def __init__(self, parent=None):
+    def __init__(self, theme="dark", parent=None):
         super().__init__(parent)
+        self.theme = theme
         self.setWindowTitle("Answer History")
         self.setMinimumSize(700, 500)
-
-        self.setStyleSheet("""
-            QDialog { background-color: #1e1e1e; }
-            QLabel { color: #e0e0e0; }
-            QLineEdit {
-                background-color: #3a3a3a; color: #e0e0e0;
-                border: 1px solid #555; border-radius: 4px;
-                padding: 8px; font-size: 13px;
-            }
-            QTextEdit {
-                background-color: #252525; color: #d4d4d4;
-                border: 1px solid #3a3a3a; border-radius: 4px;
-                font-size: 13px;
-            }
-            QPushButton {
-                font-size: 13px; padding: 8px 20px;
-                border-radius: 6px; border: none;
-            }
-        """)
+        
+        self.setStyleSheet(get_stylesheet(theme))
 
         layout = QVBoxLayout(self)
-        layout.setSpacing(10)
-        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
 
         # Header
         header = QHBoxLayout()
-        title = QLabel("\ud83d\udcdc Answer History")
-        title.setFont(QFont("Arial", 16, QFont.Bold))
-        title.setStyleSheet("color: #ffffff;")
+        title = QLabel("History")
+        title.setObjectName("Title")
         header.addWidget(title)
         header.addStretch()
 
         self.count_label = QLabel("")
-        self.count_label.setStyleSheet("color: #b0b0b0; font-size: 12px;")
+        self.count_label.setObjectName("Subtitle")
         header.addWidget(self.count_label)
         layout.addLayout(header)
 
         # Search bar
         search_layout = QHBoxLayout()
-        search_label = QLabel("\ud83d\udd0d")
-        search_layout.addWidget(search_label)
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search questions and answers...")
+        self.search_input = ModernInput(self.theme)
+        self.search_input.setPlaceholderText("🔍 Search questions and answers...")
         self.search_input.textChanged.connect(self.filter_history)
         search_layout.addWidget(self.search_input)
         layout.addLayout(search_layout)
@@ -1527,25 +1534,44 @@ class HistoryWindow(QDialog):
         # History display
         self.history_text = QTextEdit()
         self.history_text.setReadOnly(True)
+        # Apply specific text edit style from theme colors
+        c = COLORS[self.theme]
+        self.history_text.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: {c['input_bg']};
+                color: {c['text_primary']};
+                border: 1px solid {c['border']};
+                border-radius: 8px;
+                padding: 10px;
+                font-size: 14px;
+                line-height: 1.5;
+            }}
+        """)
         layout.addWidget(self.history_text)
 
         # Buttons
         btn_layout = QHBoxLayout()
-        clear_btn = QPushButton("\ud83d\uddd1\ufe0f Clear All History")
-        clear_btn.setStyleSheet("""
-            QPushButton { background-color: #c62828; color: white; }
-            QPushButton:hover { background-color: #e53935; }
+        
+        clear_btn = ModernButton("Clear All History", self.theme)
+        # Custom danger style for clear button
+        danger = COLORS[self.theme]['danger']
+        clear_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {danger};
+                color: white;
+                border: none;
+                border-radius: 8px;
+                font-weight: 600;
+                padding: 5px 15px;
+            }}
+            QPushButton:hover {{ background-color: #d32f2f; }}
         """)
         clear_btn.clicked.connect(self.clear_history)
         btn_layout.addWidget(clear_btn)
 
         btn_layout.addStretch()
 
-        close_btn = QPushButton("Close")
-        close_btn.setStyleSheet("""
-            QPushButton { background-color: #37474f; color: #b0bec5; }
-            QPushButton:hover { background-color: #455a64; }
-        """)
+        close_btn = ModernButton("Close", self.theme)
         close_btn.clicked.connect(self.close)
         btn_layout.addWidget(close_btn)
         layout.addLayout(btn_layout)
@@ -1569,10 +1595,12 @@ class HistoryWindow(QDialog):
         """Display a list of history entries"""
         self.history_text.clear()
         self.count_label.setText(f"{len(entries)} entries")
+        
+        c = COLORS[self.theme]
 
         if not entries:
             self.history_text.setHtml(
-                '<div style="color: #888; text-align: center; margin-top: 50px;">'
+                f'<div style="color: {c["text_secondary"]}; text-align: center; margin-top: 50px;">'
                 'No history entries yet.<br>Start detecting questions to build history.</div>'
             )
             return
@@ -1591,23 +1619,26 @@ class HistoryWindow(QDialog):
                 ts_fmt = dt.strftime("%Y-%m-%d %H:%M")
             except Exception:
                 ts_fmt = ts
+            
+            # Styles for HTML
+            meta_style = f"color: {c['text_secondary']}; font-size: 12px; margin-bottom: 4px;"
+            q_style = f"color: {c['accent']}; font-weight: bold; margin-bottom: 2px;"
+            a_style = f"color: {c['text_primary']}; margin-bottom: 15px;"
 
-            meta = f"<span style='color:#888;font-size:11px;'>{ts_fmt}"
+            meta = f"<div style='{meta_style}'>{ts_fmt}"
             if lang:
-                meta += f" | {lang}"
+                meta += f" • {lang}"
             if topic:
-                meta += f" | {topic}"
-            meta += "</span>"
+                meta += f" • {topic}"
+            meta += "</div>"
 
             self.history_text.append(
-                f'{meta}<br>'
-                f'<div style="background-color:#1a3a5c;padding:8px;margin:3px 0;border-radius:4px;">'
-                f'<b style="color:#64b5f6;">Q:</b> '
-                f'<span style="color:#e0e0e0;">{q}</span></div>'
-                f'<div style="background-color:#1b4332;padding:8px;margin:3px 0;border-radius:4px;">'
-                f'<b style="color:#81c784;">A:</b> '
-                f'<span style="color:#e0e0e0;">{a}</span></div>'
-                f'<hr style="border-color:#333;">'
+                f'<div style="margin-bottom: 15px;">'
+                f'{meta}'
+                f'<div style="{q_style}">Q: {q}</div>'
+                f'<div style="{a_style}">A: {a}</div>'
+                f'<hr style="border: 0; border-top: 1px solid {c["border"]}; margin: 10px 0;">'
+                f'</div>'
             )
 
     def filter_history(self, text):
@@ -1646,22 +1677,14 @@ class HistoryWindow(QDialog):
 
 def main():
     app = QApplication(sys.argv)
-    app.setStyle('Fusion')
-
-    # Dark palette for all windows
-    palette = QPalette()
-    palette.setColor(QPalette.Window, QColor(45, 45, 45))
-    palette.setColor(QPalette.WindowText, QColor(224, 224, 224))
-    palette.setColor(QPalette.Base, QColor(37, 37, 37))
-    palette.setColor(QPalette.AlternateBase, QColor(45, 45, 45))
-    palette.setColor(QPalette.ToolTipBase, QColor(224, 224, 224))
-    palette.setColor(QPalette.ToolTipText, QColor(224, 224, 224))
-    palette.setColor(QPalette.Text, QColor(224, 224, 224))
-    palette.setColor(QPalette.Button, QColor(45, 45, 45))
-    palette.setColor(QPalette.ButtonText, QColor(224, 224, 224))
-    palette.setColor(QPalette.Highlight, QColor(74, 144, 217))
-    palette.setColor(QPalette.HighlightedText, QColor(0, 0, 0))
-    app.setPalette(palette)
+    
+    # Load config to determine initial theme
+    config = load_config()
+    theme = config.get("theme", "dark")
+    
+    # Apply global theme (Palette + Stylesheet)
+    app.setStyle('Fusion') # Fusion provides good base for custom palette. Set BEFORE palette!
+    apply_theme_palette(app, theme)
 
     window = ConfigWindow()
     window.show()

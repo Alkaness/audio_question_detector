@@ -5,17 +5,16 @@ Cross-platform: auto-detects Linux/Windows for hotkeys, audio sources, and steal
 Multi-window architecture: Config → Test Mode / Overlay Mode
 """
 
-import sys, os, time, queue, threading, subprocess, struct
+import sys, os, time, queue, threading, subprocess, re
 import wave, json, platform
 from io import BytesIO
 from datetime import datetime
 from pathlib import Path
-import logging
 import requests  # For auto-update check
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QComboBox,
-                             QTextEdit, QGroupBox, QMessageBox, QDesktopWidget,
+                             QTextEdit, QGroupBox, QMessageBox,
                              QLineEdit, QDialog, QScrollArea, QCheckBox,
                              QRubberBand)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPoint, QRect, QSize, QUrl
@@ -151,7 +150,6 @@ QUESTION_WORDS_ENGLISH = [
     "can", "could", "would", "should", "is", "are", "do", "does", "did"
 ]
 QUESTION_WORDS = QUESTION_WORDS_UKRAINIAN + QUESTION_WORDS_ENGLISH
-CONTEXT_KEYWORDS = []
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -172,6 +170,8 @@ class AudioDetectorWorker:
         self.signals = signals
         self.sample_rate = sample_rate
         self.is_running = False
+        if not GROQ_API_KEY:
+            raise ValueError("GROQ_API_KEY is not set. Add it to .env file.")
         self.client = Groq(api_key=GROQ_API_KEY)
         self.audio_queue = queue.Queue()
         self.last_transcription = ""
@@ -264,15 +264,22 @@ class AudioDetectorWorker:
             return raw_text
 
     def is_question(self, text):
-        if not text:
+        """Check if transcription is likely a question."""
+        if not text or len(text.strip()) < 5:
             return False
-        return True
-
-    def is_relevant(self, text):
-        if not CONTEXT_KEYWORDS:
+        text_lower = text.lower().strip()
+        # Check for question mark
+        if text.strip().endswith('?'):
             return True
-        text_lower = text.lower()
-        return any(keyword in text_lower for keyword in CONTEXT_KEYWORDS)
+        # Check for question words at start of sentence
+        first_word = text_lower.split()[0] if text_lower.split() else ""
+        if first_word in QUESTION_WORDS:
+            return True
+        # Check for question words anywhere (weaker signal, but still useful)
+        words = set(text_lower.split())
+        if words & set(QUESTION_WORDS):
+            return True
+        return False
 
     def answer_question(self, question):
         try:
@@ -307,7 +314,6 @@ class AudioDetectorWorker:
             answer = chat_completion.choices[0].message.content.strip()
 
             # Extract confidence score
-            import re
             conf_match = re.search(r'\[CONF:(\d+)\]', answer)
             confidence = None
             if conf_match:
@@ -335,12 +341,15 @@ class AudioDetectorWorker:
             return "Sorry, could not generate an answer."
 
     def _save_to_history(self, question, answer):
-        """Append Q&A to history JSON file."""
+        """Append Q&A to history JSON file (with file locking)."""
         try:
             history = []
             if HISTORY_FILE.exists():
                 with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
-                    history = json.load(f)
+                    try:
+                        history = json.load(f)
+                    except json.JSONDecodeError:
+                        history = []  # Corrupted file, start fresh
             history.append({
                 "timestamp": datetime.now().isoformat(),
                 "question": question,
@@ -348,8 +357,11 @@ class AudioDetectorWorker:
                 "language": self.language,
                 "topic": self.topic
             })
-            with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+            # Write atomically: write to temp, then rename
+            tmp_file = HISTORY_FILE.with_suffix('.tmp')
+            with open(tmp_file, 'w', encoding='utf-8') as f:
                 json.dump(history, f, ensure_ascii=False, indent=2)
+            tmp_file.replace(HISTORY_FILE)
         except Exception:
             pass  # Don't break detection over history file errors
 
@@ -707,7 +719,7 @@ class AreaSelectionWindow(QWidget):
         self.setCursor(Qt.CrossCursor)
         self.rubberband = QRubberBand(QRubberBand.Rectangle, self)
         self.origin = QPoint()
-        self.setGeometry(QDesktopWidget().screenGeometry())
+        self.setGeometry(QApplication.primaryScreen().geometry())
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -718,7 +730,7 @@ class AreaSelectionWindow(QWidget):
             self.origin = event.pos()
             self.rubberband.setGeometry(QRect(self.origin, QSize()))
             self.rubberband.show()
-        elif event.button() == Qt.RightButton or event.key() == Qt.Key_Escape:
+        elif event.button() == Qt.RightButton:
             self.close()
             self.parent_config.show()
 
@@ -756,6 +768,8 @@ class ConfigWindow(QWidget):
         self.overlay_window = None
         self.history_window = None
         self.init_ui()
+        # Wire update signal to handler
+        self.update_available.connect(self.on_update_available)
         self.check_for_updates()
 
     def init_ui(self):
@@ -765,7 +779,7 @@ class ConfigWindow(QWidget):
         self.theme = self.config.get("theme", "dark")
         
         # Center on screen
-        screen = QDesktopWidget().screenGeometry()
+        screen = QApplication.primaryScreen().geometry()
         x = (screen.width() - 500) // 2
         y = (screen.height() - 650) // 2
         self.move(x, y)
@@ -1265,7 +1279,7 @@ class OverlayWindow(QWidget):
         if geometry:
             self.setGeometry(QRect(*geometry))
         else:
-            self.setGeometry(QDesktopWidget().screenGeometry())
+            self.setGeometry(QApplication.primaryScreen().geometry())
 
         # Layout
         layout = QVBoxLayout()
@@ -1681,6 +1695,10 @@ def main():
     # Load config to determine initial theme
     config = load_config()
     theme = config.get("theme", "dark")
+    
+    # Validate API key early
+    if not GROQ_API_KEY or GROQ_API_KEY == "your_groq_api_key_here":
+        print("WARNING: GROQ_API_KEY not set. Create .env file with: GROQ_API_KEY=your_key")
     
     # Apply global theme (Palette + Stylesheet)
     app.setStyle('Fusion') # Fusion provides good base for custom palette. Set BEFORE palette!

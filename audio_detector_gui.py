@@ -159,7 +159,10 @@ QUESTION_WORDS = QUESTION_WORDS_UKRAINIAN + QUESTION_WORDS_ENGLISH
 class WorkerSignals(QObject):
     """Signals for GUI communication"""
     log = pyqtSignal(str, str)
-    question = pyqtSignal(str, str)
+    question = pyqtSignal(str, str)          # legacy: final Q&A (used for history)
+    answer_start = pyqtSignal(str)           # streaming: question text, starts answer block
+    answer_token = pyqtSignal(str)           # streaming: one token at a time
+    answer_done = pyqtSignal(str, str)       # streaming: final (question, full_answer)
 
 
 class AudioDetectorWorker:
@@ -282,6 +285,7 @@ class AudioDetectorWorker:
         return False
 
     def answer_question(self, question):
+        """Generate answer with streaming tokens."""
         try:
             topic_ctx = ""
             if self.topic:
@@ -303,15 +307,27 @@ class AudioDetectorWorker:
                 messages.append({"role": "assistant", "content": prev_a})
             messages.append({"role": "user", "content": question})
 
-            # Non-streaming response
-            chat_completion = self.client.chat.completions.create(
+            # Signal UI to prepare answer block
+            self.signals.answer_start.emit(question)
+
+            # Streaming response
+            stream = self.client.chat.completions.create(
                 messages=messages,
                 model="llama-3.3-70b-versatile",
                 temperature=0.7,
                 max_tokens=300,
-                top_p=0.9
+                top_p=0.9,
+                stream=True
             )
-            answer = chat_completion.choices[0].message.content.strip()
+
+            full_answer = ""
+            for chunk in stream:
+                token = chunk.choices[0].delta.content or ""
+                if token:
+                    full_answer += token
+                    self.signals.answer_token.emit(token)
+
+            answer = full_answer.strip()
 
             # Extract confidence score
             conf_match = re.search(r'\[CONF:(\d+)\]', answer)
@@ -333,8 +349,10 @@ class AudioDetectorWorker:
             self.conversation_history.append((question, answer))
             if len(self.conversation_history) > 10:
                 self.conversation_history = self.conversation_history[-10:]
-            # Save to history file
             self._save_to_history(question, answer)
+
+            # Signal UI that answer is complete (for confidence badge update)
+            self.signals.answer_done.emit(question, answer)
             return answer
         except Exception as e:
             self.signals.log.emit(f"Answer generation error: {e}", "error")
@@ -437,8 +455,7 @@ class AudioDetectorWorker:
         self.signals.log.emit(f"Transcription: {transcription}", "info")
         if self.is_question(transcription):
             self.signals.log.emit("Generating answer...", "info")
-            answer = self.answer_question(transcription)
-            self.signals.question.emit(transcription, answer)
+            self.answer_question(transcription)  # streaming signals handle UI updates
 
     def run(self):
         self.is_running = True
@@ -1176,8 +1193,8 @@ class TestModeWindow(QMainWindow):
         self.log_text.moveCursor(QTextCursor.End)
 
     def add_qa(self, question, answer):
+        """Add complete Q&A pair (non-streaming fallback)"""
         c = COLORS[self.theme]
-        # Use theme-aware subtle backgrounds
         q_bg = c['input_bg']
         a_bg = c['card']
         self.qa_text.append(
@@ -1190,10 +1207,49 @@ class TestModeWindow(QMainWindow):
         )
         self.qa_text.moveCursor(QTextCursor.End)
 
+    def on_answer_start(self, question):
+        """Streaming: prepare question block, start empty answer"""
+        c = COLORS[self.theme]
+        q_bg = c['input_bg']
+        self.qa_text.append(
+            f'<div style="background-color: {q_bg}; padding: 10px; margin: 5px; border-radius: 6px; border: 1px solid {c["border"]};">' 
+            f'<b style="color: {c["accent"]};">TEXT:</b> <span style="color: {c["text_primary"]};">{question}</span></div>'
+        )
+        # Start answer block with label
+        c2 = COLORS[self.theme]
+        a_bg = c2['card']
+        self.qa_text.append(
+            f'<div style="background-color: {a_bg}; padding: 10px; margin: 5px; border-radius: 6px; border: 1px solid {c2["border"]};">' 
+            f'<b style="color: {c2["success"]};">ANSWER:</b> <span style="color: {c2["text_primary"]};" id="streaming">'
+        )
+        self._streaming_answer = ""
+        self.qa_text.moveCursor(QTextCursor.End)
+
+    def on_answer_token(self, token):
+        """Streaming: append one token to current answer"""
+        self._streaming_answer += token
+        # Insert token at cursor position (end of document)
+        cursor = self.qa_text.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertText(token)
+        self.qa_text.setTextCursor(cursor)
+        self.qa_text.ensureCursorVisible()
+
+    def on_answer_done(self, question, answer):
+        """Streaming: finalize answer block"""
+        # Close the open HTML tags
+        cursor = self.qa_text.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertHtml('</span></div><br>')
+        self.qa_text.moveCursor(QTextCursor.End)
+
     def start_detection(self):
         signals = WorkerSignals()
         signals.log.connect(self.log_message)
         signals.question.connect(self.add_qa)
+        signals.answer_start.connect(self.on_answer_start)
+        signals.answer_token.connect(self.on_answer_token)
+        signals.answer_done.connect(self.on_answer_done)
         self.worker = AudioDetectorWorker(self.device_index, signals, self.sample_rate, self.language, self.topic, self.whisper_prompt)
         self.worker_thread = threading.Thread(target=self.worker.run, daemon=True)
         self.worker_thread.start()
@@ -1455,12 +1511,11 @@ class OverlayWindow(QWidget):
         pass  # Overlay shows only Q&A
 
     def add_qa(self, question, answer):
-        """Add answer to overlay (non-streaming)"""
+        """Add complete Q&A to overlay (non-streaming fallback)"""
         if self.is_silent: return
-        self.last_answer = answer  # Store for clipboard copy
+        self.last_answer = answer
         
         fs = self.overlay_font_size
-        # Overlay always has dark background, so always use white/blue text
         self.text_display.append(
             f'<div style="margin-bottom: 5px; margin-top: 15px;">'
             f'<div style="color: #0A84FF; font-size: {fs - 2}px; margin-bottom: 4px; font-weight: bold;">'
@@ -1471,10 +1526,45 @@ class OverlayWindow(QWidget):
         )
         self.text_display.moveCursor(QTextCursor.End)
 
+    def on_answer_start(self, question):
+        """Streaming: prepare question block, start empty answer"""
+        if self.is_silent: return
+        fs = self.overlay_font_size
+        self.text_display.append(
+            f'<div style="margin-bottom: 5px; margin-top: 15px;">'
+            f'<div style="color: #0A84FF; font-size: {fs - 2}px; margin-bottom: 4px; font-weight: bold;">'
+            f'Q: {question}</div>'
+            f'<div style="color: #FFFFFF; font-size: {fs}px; line-height: 1.4;">'
+            f'A: '
+        )
+        self._streaming_answer = ""
+        self.text_display.moveCursor(QTextCursor.End)
+
+    def on_answer_token(self, token):
+        """Streaming: append one token"""
+        if self.is_silent: return
+        self._streaming_answer += token
+        cursor = self.text_display.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertText(token)
+        self.text_display.setTextCursor(cursor)
+        self.text_display.ensureCursorVisible()
+
+    def on_answer_done(self, question, answer):
+        """Streaming: finalize answer"""
+        self.last_answer = answer
+        cursor = self.text_display.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertHtml('</div></div>')
+        self.text_display.moveCursor(QTextCursor.End)
+
     def start_detection(self):
         signals = WorkerSignals()
         signals.log.connect(self.log_message)
         signals.question.connect(self.add_qa)
+        signals.answer_start.connect(self.on_answer_start)
+        signals.answer_token.connect(self.on_answer_token)
+        signals.answer_done.connect(self.on_answer_done)
         self.worker = AudioDetectorWorker(self.device_index, signals, self.sample_rate, self.language, self.topic, self.config.get("whisper_prompt", ""))
         self.worker_thread = threading.Thread(target=self.worker.run, daemon=True)
         self.worker_thread.start()

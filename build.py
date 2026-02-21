@@ -19,7 +19,6 @@ HIDDEN_IMPORTS = [
     "sounddevice",
     "numpy",
     "groq",
-    "pyttsx3",
     "dotenv",
     "PyQt5",
     "PyQt5.QtWidgets",

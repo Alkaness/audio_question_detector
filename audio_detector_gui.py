@@ -16,9 +16,9 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QComboBox,
                              QTextEdit, QGroupBox, QMessageBox,
                              QLineEdit, QDialog, QScrollArea, QCheckBox,
-                             QRubberBand)
+                             QRubberBand, QSystemTrayIcon, QMenu, QAction)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPoint, QRect, QSize, QUrl
-from PyQt5.QtGui import QFont, QTextCursor, QColor, QPalette, QPainter, QPen, QDesktopServices
+from PyQt5.QtGui import QFont, QTextCursor, QColor, QPalette, QPainter, QPen, QDesktopServices, QIcon, QPixmap
 
 import sounddevice as sd
 import numpy as np
@@ -765,7 +765,9 @@ class ConfigWindow(QWidget):
         self.test_window = None
         self.overlay_window = None
         self.history_window = None
+        self._force_quit = False  # True when user explicitly quits
         self.init_ui()
+        self.setup_tray()
         # Wire update signal to handler
         self.update_available.connect(self.on_update_available)
         self.check_for_updates()
@@ -1054,6 +1056,96 @@ class ConfigWindow(QWidget):
         self.show()
         self.raise_()
         self.activateWindow()
+
+    def setup_tray(self):
+        """Create system tray icon with context menu"""
+        # Create a simple app icon (colored circle)
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor("#0A84FF"))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(4, 4, 56, 56)
+        # White headphone shape
+        painter.setBrush(QColor("#FFFFFF"))
+        painter.drawEllipse(12, 28, 12, 16)
+        painter.drawEllipse(40, 28, 12, 16)
+        painter.setPen(QPen(QColor("#FFFFFF"), 3))
+        painter.drawArc(16, 12, 32, 32, 30 * 16, 120 * 16)
+        painter.end()
+        icon = QIcon(pixmap)
+
+        self.tray_icon = QSystemTrayIcon(icon, self)
+        self.tray_icon.setToolTip(f"Audio Question Detector v{APP_VERSION}")
+
+        # Tray menu
+        tray_menu = QMenu()
+        show_action = QAction("Show Settings", self)
+        show_action.triggered.connect(self.show_config)
+        tray_menu.addAction(show_action)
+
+        tray_menu.addSeparator()
+
+        test_action = QAction("Start Test Mode", self)
+        test_action.triggered.connect(lambda: self._tray_launch(0))
+        tray_menu.addAction(test_action)
+
+        overlay_action = QAction("Start Overlay Mode", self)
+        overlay_action.triggered.connect(lambda: self._tray_launch(1))
+        tray_menu.addAction(overlay_action)
+
+        tray_menu.addSeparator()
+
+        history_action = QAction("History", self)
+        history_action.triggered.connect(self.show_history)
+        tray_menu.addAction(history_action)
+
+        tray_menu.addSeparator()
+
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self._quit_app)
+        tray_menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._tray_activated)
+        self.tray_icon.show()
+
+        # Set app icon too
+        self.setWindowIcon(icon)
+
+    def _tray_activated(self, reason):
+        """Handle tray icon click"""
+        if reason == QSystemTrayIcon.Trigger:  # Single click
+            if self.isVisible():
+                self.hide()
+            else:
+                self.show_config()
+
+    def _tray_launch(self, mode_index):
+        """Launch detection from tray menu"""
+        self.mode_combo.setCurrentIndex(mode_index)
+        self.launch_mode()
+
+    def _quit_app(self):
+        """Actually quit the application"""
+        self._force_quit = True
+        self.tray_icon.hide()
+        QApplication.quit()
+
+    def closeEvent(self, event):
+        """Minimize to tray instead of quitting"""
+        if self._force_quit:
+            event.accept()
+            return
+        event.ignore()
+        self.hide()
+        self.tray_icon.showMessage(
+            "Audio Question Detector",
+            "App minimized to tray. Right-click the tray icon for options.",
+            QSystemTrayIcon.Information,
+            2000
+        )
 
     def show_history(self):
         """Open history window — always recreate to ensure fresh theme"""

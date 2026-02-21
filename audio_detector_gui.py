@@ -94,6 +94,7 @@ def load_config():
         "whisper_prompt": "",
         "font_size": 16,
         "theme": "dark",
+        "minimize_to_tray": True,
         "overlay_geometry": None,  # None = fullscreen
         "source_name": None,
     }
@@ -888,6 +889,12 @@ class ConfigWindow(QWidget):
         self.area_btn.clicked.connect(self.select_overlay_area)
         card_layout.addWidget(self.area_btn)
 
+        # 6. Minimize to tray toggle
+        self.tray_toggle = QCheckBox("Minimize to tray on close")
+        self.tray_toggle.setChecked(self.config.get("minimize_to_tray", True))
+        self.tray_toggle.stateChanged.connect(self._on_tray_toggle)
+        card_layout.addWidget(self.tray_toggle)
+
         main_layout.addWidget(self.settings_card)
         main_layout.addStretch()
 
@@ -1133,19 +1140,28 @@ class ConfigWindow(QWidget):
         self.tray_icon.hide()
         QApplication.quit()
 
+    def _on_tray_toggle(self, state):
+        """Save minimize-to-tray preference"""
+        self.config["minimize_to_tray"] = self.tray_toggle.isChecked()
+        save_config(self.config)
+
     def closeEvent(self, event):
-        """Minimize to tray instead of quitting"""
+        """Minimize to tray or quit based on user preference"""
         if self._force_quit:
             event.accept()
             return
-        event.ignore()
-        self.hide()
-        self.tray_icon.showMessage(
-            "Audio Question Detector",
-            "App minimized to tray. Right-click the tray icon for options.",
-            QSystemTrayIcon.Information,
-            2000
-        )
+        if self.config.get("minimize_to_tray", True):
+            event.ignore()
+            self.hide()
+            self.tray_icon.showMessage(
+                "Audio Question Detector",
+                "App minimized to tray. Right-click the tray icon for options.",
+                QSystemTrayIcon.Information,
+                2000
+            )
+        else:
+            self._quit_app()
+            event.accept()
 
     def show_history(self):
         """Open history window — always recreate to ensure fresh theme"""

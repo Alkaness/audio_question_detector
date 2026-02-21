@@ -1116,7 +1116,9 @@ class ConfigWindow(QWidget):
 
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.activated.connect(self._tray_activated)
-        self.tray_icon.show()
+        # Only show tray icon if enabled in settings
+        if self.config.get("minimize_to_tray", True):
+            self.tray_icon.show()
 
         # Set app icon too
         self.setWindowIcon(icon)
@@ -1141,9 +1143,15 @@ class ConfigWindow(QWidget):
         QApplication.quit()
 
     def _on_tray_toggle(self, state):
-        """Save minimize-to-tray preference"""
-        self.config["minimize_to_tray"] = self.tray_toggle.isChecked()
+        """Save minimize-to-tray preference and show/hide tray icon"""
+        enabled = self.tray_toggle.isChecked()
+        self.config["minimize_to_tray"] = enabled
         save_config(self.config)
+        # Show or hide the tray icon itself
+        if enabled:
+            self.tray_icon.show()
+        else:
+            self.tray_icon.hide()
 
     def closeEvent(self, event):
         """Minimize to tray or quit based on user preference"""

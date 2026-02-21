@@ -8,8 +8,8 @@
 
 <p align="center">
   <a href="https://github.com/Alkaness/audio_question_detector/actions"><img src="https://img.shields.io/github/actions/workflow/status/Alkaness/audio_question_detector/ci.yml?branch=main&label=CI&logo=github" alt="CI"></a>
-  <a href="https://github.com/Alkaness/audio_question_detector/releases"><img src="https://img.shields.io/github/v/release/Alkaness/audio_question_detector?label=Release&logo=github" alt="Release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/Alkaness/audio_question_detector?label=License" alt="License"></a>
+  <img src="https://img.shields.io/badge/version-1.3.0-blue?logo=github" alt="Version 1.3.0">
+  <a href="https://github.com/Alkaness/audio_question_detector/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
   <img src="https://img.shields.io/badge/python-3.9+-blue?logo=python&logoColor=white" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/AI-Groq%20LLaMA%203.3-orange?logo=meta" alt="AI">

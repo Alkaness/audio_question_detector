@@ -42,61 +42,77 @@
 
 ## Architecture
 
+### How It Works
+
+The application follows a simple pipeline — audio goes in, answers come out:
+
 ```mermaid
-graph TB
-    subgraph UI["GUI Layer · PyQt5"]
-        CW["ConfigWindow<br/>Settings & Launch"]
-        TM["TestModeWindow<br/>Windowed Q&A"]
-        OW["OverlayWindow<br/>Stealth Fullscreen"]
-        HW["HistoryWindow<br/>Search & Browse"]
-    end
-
-    subgraph Core["Core Engine"]
-        ADW["AudioDetectorWorker<br/>Audio capture + VAD"]
-        WH["Whisper · Groq<br/>Speech-to-Text"]
-        LLM["LLaMA 3.3 70B · Groq<br/>Question-to-Answer"]
-    end
-
-    subgraph Platform["Platform Layer"]
-        HK["HotkeyManager<br/>evdev / pynput"]
-        AS["Audio Sources<br/>pactl / sounddevice"]
-        ST["Stealth Mode<br/>Win32 / NSWindow / Qt"]
-    end
-
-    CW -->|"Test Mode"| TM
-    CW -->|"Overlay Mode"| OW
-    CW -->|"View History"| HW
-    TM --> ADW
-    OW --> ADW
-    ADW -->|"audio chunk"| WH
-    WH -->|"transcription"| LLM
-    LLM -->|"answer"| TM & OW
-    OW --> HK
-    OW --> ST
-    CW --> AS
+graph LR
+    MIC["Microphone /<br/>System Audio"] --> CAP["Audio Capture<br/>(sounddevice)"]
+    CAP --> VAD["Speech Detection<br/>(WebRTC VAD)"]
+    VAD --> STT["Speech-to-Text<br/>(Groq Whisper)"]
+    STT --> DET{"Is it a<br/>question?"}
+    DET -->|Yes| LLM["Generate Answer<br/>(Groq LLaMA 3.3)"]
+    DET -->|No| SKIP["Skip"]
+    LLM --> DISP["Display in<br/>Overlay / Window"]
+    LLM --> HIST["Save to<br/>History"]
 ```
+
+### Application Windows
+
+The user moves through the application in a straightforward flow:
+
+```mermaid
+graph LR
+    CFG["Settings"] -->|"Start"| TEST["Test Mode<br/>(standard window)"]
+    CFG -->|"Start"| OVER["Overlay Mode<br/>(stealth fullscreen)"]
+    CFG -->|"History"| HIST["History Viewer"]
+    TEST -->|"Stop"| CFG
+    OVER -->|"Escape / F3×2"| CFG
+    HIST -->|"Close"| CFG
+```
+
+| Window | Purpose |
+|--------|---------|
+| **ConfigWindow** | Select audio source, language, topic, whisper prompt, theme. Entry point. |
+| **TestModeWindow** | Standard window showing live log + Q&A. For debugging and development. |
+| **OverlayWindow** | Transparent always-on-top window. Invisible to screen capture (Win/Mac). Controlled entirely via hotkeys. |
+| **HistoryWindow** | Browse and search all past Q&A entries. |
+
+### Platform Abstraction
+
+Each platform-specific concern is handled by a dedicated abstraction:
+
+| Concern | Linux | Windows | macOS |
+|---------|-------|---------|-------|
+| Audio sources | PulseAudio (`pactl`) | `sounddevice` (WASAPI) | `sounddevice` (CoreAudio) |
+| Global hotkeys | `evdev` (raw `/dev/input`) | `pynput` | `pynput` |
+| Screen capture exclusion | Not available | `SetWindowDisplayAffinity` | `NSWindow.sharingType` |
 
 ### File Structure
 
-```
-audio_detector_gui.py  — Main application (~1700 LOC, cross-platform)
-modern_widgets.py      — Custom Qt widgets (ModernCard, ModernButton, ModernToggle, etc.)
-styles.py              — Theme engine (color palette, stylesheets, palette management)
-build.py               — PyInstaller build script (auto-detects platform)
-launch.sh              — Linux / macOS launcher (auto-creates venv)
-launch.bat             — Windows launcher
-requirements.txt       — Dependencies (platform-conditional)
-.env                   — Groq API key (not committed)
-```
+| File | Description |
+|------|-------------|
+| `audio_detector_gui.py` | Main application — all windows, worker, hotkey manager (~1700 LOC) |
+| `modern_widgets.py` | Custom themed Qt widgets (ModernCard, ModernButton, ModernToggle, ModernComboBox, ModernDialog) |
+| `styles.py` | Color palette, QSS stylesheet generator, QPalette theme applicator |
+| `build.py` | PyInstaller build script, auto-detects platform |
+| `launch.sh` | Linux / macOS launcher (auto-creates `.venv`) |
+| `launch.bat` | Windows launcher |
+| `requirements.txt` | Python dependencies with platform-conditional entries |
+| `.env` | Groq API key (not committed to git) |
 
-### Data Flow
+### Processing Pipeline Detail
 
-1. **Audio capture** — `sounddevice` InputStream records in 100ms blocks
-2. **VAD chunking** — WebRTC VAD (or RMS fallback) detects speech boundaries (2–15s chunks)
-3. **Transcription** — Groq Whisper `large-v3` with configurable prompt and conversation context
-4. **Question detection** — keyword matching and punctuation heuristics
-5. **Answer generation** — Groq LLaMA 3.3 70B with conversation memory (last 10 pairs)
-6. **Display** — Rich HTML rendering in overlay or test window
+| Step | Technology | What happens |
+|------|-----------|--------------|
+| 1. Capture | `sounddevice` | Records audio in 100ms blocks from selected input device |
+| 2. Buffering | NumPy | Accumulates audio chunks in memory (2–15 seconds) |
+| 3. Speech detection | WebRTC VAD / RMS | Detects silence boundaries to split audio into speech segments |
+| 4. Transcription | Groq Whisper `large-v3` | Converts speech to text, uses custom prompt + prior context for accuracy |
+| 5. Question detection | Heuristics | Checks for question words and punctuation patterns |
+| 6. Answer generation | Groq LLaMA 3.3 70B | Generates answer using conversation memory (last 10 Q&A pairs) |
+| 7. Display | PyQt5 QTextEdit | Renders answer as styled HTML in the active window |
 
 ## Platform Support
 

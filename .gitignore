@@ -28,6 +28,7 @@ ENV/
 env.bak/
 venv.bak/
 build_venv/
+.venv/
 
 # Environment Variables
 .env
@@ -41,5 +42,6 @@ build_venv/
 # Logs
 *.log
 
-# Other
-=1.7.0
+# Test screenshots
+test_captured_*.png
+

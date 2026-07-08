@@ -62,3 +62,49 @@ class OllamaProvider(AIProvider):
         except Exception as e:
             print(f"[Ollama] Answer error: {e}")
             yield f"Error: {e}"
+
+    def supports_vision(self) -> bool:
+        return True
+
+    def analyze_image(self, image_base64, system_prompt, model=None, **kwargs):
+        """Analyze an image using Ollama's vision-capable model (e.g., llava)."""
+        vision_model = model or "llava"
+        try:
+            payload = {
+                "model": vision_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": "Analyze this screenshot and provide your response:",
+                        "images": [image_base64]
+                    }
+                ],
+                "stream": True,
+                "options": {
+                    "temperature": kwargs.get("temperature", 0.3),
+                    "num_predict": kwargs.get("max_tokens", 2000),
+                }
+            }
+            resp = requests.post(
+                f"{self.base_url}/api/chat",
+                json=payload,
+                stream=True,
+                timeout=60
+            )
+            resp.raise_for_status()
+
+            for line in resp.iter_lines():
+                if line:
+                    data = json.loads(line)
+                    token = data.get("message", {}).get("content", "")
+                    if token:
+                        yield token
+                    if data.get("done", False):
+                        break
+        except requests.ConnectionError:
+            yield "Error: Cannot connect to Ollama. Is it running? (ollama serve)"
+        except Exception as e:
+            print(f"[Ollama] Vision error: {e}")
+            yield f"Error: {e}"
+

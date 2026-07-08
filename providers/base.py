@@ -45,3 +45,20 @@ class AIProvider(ABC):
     def supports_answer(self) -> bool:
         """Override to return False if provider doesn't support answers."""
         return True
+
+    def supports_vision(self) -> bool:
+        """Override to return True if provider supports image analysis."""
+        return False
+
+    def analyze_image(self, image_base64, system_prompt, model=None, **kwargs):
+        """Analyze an image using a vision-capable model.
+
+        Args:
+            image_base64: Base64-encoded JPEG image string.
+            system_prompt: System prompt for analysis context.
+            model: Optional model override.
+
+        Yields:
+            String tokens as they arrive.
+        """
+        raise NotImplementedError("This provider does not support image analysis.")

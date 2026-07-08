@@ -26,6 +26,9 @@ TRANSCRIPTION_PROVIDERS = ["groq", "openai"]
 # Which providers support answer generation
 ANSWER_PROVIDERS = ["groq", "openai", "ollama"]
 
+# Which providers support vision/image analysis
+VISION_PROVIDERS = ["groq", "openai", "ollama"]
+
 
 def get_provider(name, api_key=None, **kwargs):
     """Create a provider instance by name."""

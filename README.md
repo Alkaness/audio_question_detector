@@ -28,16 +28,22 @@
 - **Real-time audio capture** — system audio monitor or microphone input
 - **WebRTC VAD** — ML-based voice activity detection with RMS fallback
 - **AI-powered answers** — Groq Whisper transcription + LLaMA 3.3 70B generation
+- **Screen capture for coding interviews** — capture LeetCode/HackerRank problems and get AI-analyzed solutions with pseudocode, complexity analysis, and edge cases
+- **Resume & Job Description context** — upload your resume and paste the JD for personalized, tailored answers
+- **Live transcript panel** — see all transcribed speech in real-time, not just questions
 - **Stealth overlay** — transparent fullscreen overlay, invisible to screen capture on Windows and macOS
-- **9 answer languages** — Ukrainian, English, Russian, German, French, Spanish, Polish, Chinese, Japanese
+- **52 answer languages** — comprehensive Whisper language support with question-word detection
+- **Coding / Non-Coding interview modes** — optimized prompts and features for each interview type
 - **Topic context** — configurable domain for more relevant answers
 - **Custom Whisper prompt** — keywords to improve transcription accuracy
 - **Conversation memory** — maintains last 10 Q&A pairs for contextual follow-ups
 - **Clipboard integration** — copy the last answer with a hotkey
-- **Adjustable overlay font** — resize text on the fly
-- **Searchable answer history** — JSON-backed history panel with full-text search
+- **Adjustable overlay font & opacity** — resize text and control transparency on the fly
+- **Searchable answer history** — JSON-backed history panel with full-text search and Markdown export
 - **Persistent settings** — remembers preferences across restarts
 - **Dark / Light themes** — Apple-inspired UI
+- **Process name masking** — stealth process name for enhanced privacy
+- **Multi-provider support** — Groq, OpenAI (GPT-4o), and Ollama (local models)
 - **Auto-update checker** — notifies of new GitHub releases
 
 ## Architecture
@@ -93,14 +99,18 @@ Each platform-specific concern is handled by a dedicated abstraction:
 
 | File | Description |
 |------|-------------|
-| `audio_detector_gui.py` | Main application — all windows, worker, hotkey manager (~1700 LOC) |
-| `modern_widgets.py` | Custom themed Qt widgets (ModernCard, ModernButton, ModernToggle, ModernComboBox, ModernDialog) |
+| `audio_detector_gui.py` | Main application — all windows, worker, hotkey manager |
+| `screen_capture.py` | Screen capture module — mss-based capture + vision LLM analysis |
+| `context_manager.py` | Resume/JD parser and context prompt builder |
+| `languages.py` | 52-language registry with question word detection |
+| `modern_widgets.py` | Custom themed Qt widgets (ModernCard, ModernButton, ModernToggle, etc.) |
 | `styles.py` | Color palette, QSS stylesheet generator, QPalette theme applicator |
+| `providers/` | Modular AI provider backends (Groq, OpenAI, Ollama) |
 | `build.py` | PyInstaller build script, auto-detects platform |
 | `launch.sh` | Linux / macOS launcher (auto-creates `.venv`) |
 | `launch.bat` | Windows launcher |
 | `requirements.txt` | Python dependencies with platform-conditional entries |
-| `.env` | Groq API key (not committed to git) |
+| `.env` | API keys (not committed to git) |
 
 ### Processing Pipeline Detail
 
@@ -190,12 +200,16 @@ If unavailable, install [VB-Audio Virtual Cable](https://vb-audio.com/Cable/).
 | Option | Description |
 |--------|-------------|
 | **Audio Source** | System audio monitor or microphone |
-| **Mode** | Test Mode (windowed) or Overlay Mode (transparent fullscreen) |
-| **Language** | Answer language — 9 options |
+| **Interview Type** | Coding (enables screen capture) or Non-Coding |
+| **Display Mode** | Test Mode (windowed) or Overlay Mode (transparent fullscreen) |
+| **Language** | Answer language — 52 options with type-to-filter |
 | **Topic** | Context topic for better answers (e.g. "React interview", "System design") |
 | **Whisper Prompt** | Keywords to improve transcription accuracy |
+| **Resume Upload** | Upload PDF/DOCX/TXT resume for personalized answers |
+| **Job Description** | Paste JD text for targeted responses |
 | **Theme** | Dark / Light mode toggle |
 | **Overlay Area** | Custom screen region for the overlay |
+| **Live Transcript** | Show all transcribed speech (toggle on/off) |
 
 ## Overlay Hotkeys
 
@@ -207,8 +221,13 @@ All hotkeys require **double-press** within 400ms:
 | `F2` ×2 | Restore overlay |
 | `F3` ×2 | Quit application |
 | `F4` ×2 | Copy last answer to clipboard |
+| `F6` ×2 | Capture screen (coding mode) |
+| `F7` ×2 | Increase overlay opacity |
+| `F8` ×2 | Decrease overlay opacity |
 | `F9` ×2 | Increase font size |
 | `F10` ×2 | Decrease font size |
+| `F11` ×2 | Scroll overlay up |
+| `F12` ×2 | Scroll overlay down |
 | `Escape` | Close overlay, return to Settings |
 
 ## Screen Sharing Privacy

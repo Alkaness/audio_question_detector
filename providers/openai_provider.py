@@ -56,3 +56,45 @@ class OpenAIProvider(AIProvider):
         except Exception as e:
             print(f"[OpenAI] Answer error: {e}")
             yield f"Error: {e}"
+
+    def supports_vision(self) -> bool:
+        return True
+
+    def analyze_image(self, image_base64, system_prompt, model=None, **kwargs):
+        """Analyze an image using GPT-4o vision."""
+        vision_model = model or "gpt-4o"
+        try:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Analyze this screenshot and provide your response:"
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}",
+                                "detail": "high"
+                            }
+                        }
+                    ]
+                }
+            ]
+            stream = self.client.chat.completions.create(
+                messages=messages,
+                model=vision_model,
+                temperature=kwargs.get("temperature", 0.3),
+                max_tokens=kwargs.get("max_tokens", 2000),
+                stream=True
+            )
+            for chunk in stream:
+                token = chunk.choices[0].delta.content or ""
+                if token:
+                    yield token
+        except Exception as e:
+            print(f"[OpenAI] Vision error: {e}")
+            yield f"Error: {e}"
+

@@ -293,25 +293,7 @@ class AudioDetectorWorker:
 
     def correct_transcription(self, raw_text):
         try:
-            correction = self.client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content":
-                        "You are a speech recognition text corrector.\n"
-                        "Strict rules:\n"
-                        "1. Fix ONLY individual words that are obviously garbled IT terms\n"
-                        "2. NEVER add new words or sentences\n"
-                        "3. NEVER delete words\n"
-                        "4. NEVER explain or expand the text\n"
-                        "5. The word count in your response must match the original\n"
-                        "6. If the text is already correct, return it unchanged\n"
-                        "Examples: 'paithan' → 'Python', 'rest apay' → 'REST API', 'dokker' → 'Docker'."},
-                    {"role": "user", "content": raw_text}
-                ],
-                model="llama-3.1-8b-instant",
-                temperature=0.0,
-                max_tokens=150
-            )
-            corrected = correction.choices[0].message.content.strip()
+            corrected = self.transcription_provider.correct_text(raw_text)
             if len(corrected) > len(raw_text) * 1.5 or len(corrected) < len(raw_text) * 0.5:
                 self.signals.log.emit("Correction rejected (change too large)", "warning")
                 return raw_text
@@ -319,6 +301,7 @@ class AudioDetectorWorker:
         except Exception as e:
             self.signals.log.emit(f"Correction error: {e}", "warning")
             return raw_text
+
 
     def is_question(self, text):
         """Check if transcription is likely a question."""

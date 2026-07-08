@@ -62,3 +62,15 @@ class AIProvider(ABC):
             String tokens as they arrive.
         """
         raise NotImplementedError("This provider does not support image analysis.")
+
+    def correct_text(self, text) -> str:
+        """Correct raw transcribed text (default: no-op).
+
+        Args:
+            text: Raw text to correct.
+
+        Returns:
+            Corrected text.
+        """
+        return text
+

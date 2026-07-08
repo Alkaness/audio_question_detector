@@ -98,3 +98,32 @@ class OpenAIProvider(AIProvider):
             print(f"[OpenAI] Vision error: {e}")
             yield f"Error: {e}"
 
+    def correct_text(self, text) -> str:
+        """Correct raw transcribed text using OpenAI GPT-4o-mini."""
+        if not text:
+            return ""
+        try:
+            correction = self.client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content":
+                        "You are a speech recognition text corrector.\n"
+                        "Strict rules:\n"
+                        "1. Fix ONLY individual words that are obviously garbled IT terms\n"
+                        "2. NEVER add new words or sentences\n"
+                        "3. NEVER delete words\n"
+                        "4. NEVER explain or expand the text\n"
+                        "5. The word count in your response must match the original\n"
+                        "6. If the text is already correct, return it unchanged\n"
+                        "Examples: 'paithan' → 'Python', 'rest apay' → 'REST API', 'dokker' → 'Docker'."},
+                    {"role": "user", "content": text}
+                ],
+                model=self.DEFAULT_ANSWER_MODEL,
+                temperature=0.0,
+                max_tokens=150
+            )
+            return correction.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"[OpenAI] Correction error: {e}")
+            return text
+
+

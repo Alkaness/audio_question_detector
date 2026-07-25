@@ -25,15 +25,19 @@ class OpenAIProvider(AIProvider):
             raise ValueError("OpenAI requires an API key. Set OPENAI_API_KEY in .env")
         self.client = OpenAI(api_key=api_key)
 
-    def transcribe(self, wav_buffer, language="uk", prompt="") -> str:
+    def transcribe(self, wav_buffer, language="en", prompt="") -> str:
         try:
-            transcription = self.client.audio.transcriptions.create(
-                file=wav_buffer,
-                model=self.DEFAULT_TRANSCRIPTION_MODEL,
-                response_format="text",
-                prompt=prompt,
-                temperature=0.0
-            )
+            wav_buffer.seek(0)
+            kwargs = {
+                "file": wav_buffer,
+                "model": self.DEFAULT_TRANSCRIPTION_MODEL,
+                "response_format": "text",
+                "prompt": prompt,
+                "temperature": 0.0
+            }
+            if language:
+                kwargs["language"] = language
+            transcription = self.client.audio.transcriptions.create(**kwargs)
             return transcription.strip() if transcription else ""
         except Exception as e:
             print(f"[OpenAI] Transcription error: {e}")

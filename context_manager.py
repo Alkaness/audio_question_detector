@@ -41,8 +41,8 @@ def load_context():
             with open(CONTEXT_FILE, 'r', encoding='utf-8') as f:
                 saved = json.load(f)
             defaults.update(saved)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[ContextManager] Error loading context: {e}")
     return defaults
 
 
@@ -51,8 +51,8 @@ def save_context(context):
     try:
         with open(CONTEXT_FILE, 'w', encoding='utf-8') as f:
             json.dump(context, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[ContextManager] Error saving context: {e}")
 
 
 def parse_resume(file_path):

@@ -5,7 +5,7 @@ Cross-platform: auto-detects Linux/Windows for hotkeys, audio sources, and steal
 Multi-window architecture: Config → Test Mode / Overlay Mode
 """
 
-import sys, os, time, queue, threading, subprocess, re
+import sys, os, time, queue, threading, subprocess, re, html, shutil
 import wave, json, platform
 from io import BytesIO
 from datetime import datetime
@@ -24,8 +24,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTextEdit, QGroupBox, QMessageBox,
                              QLineEdit, QDialog, QScrollArea, QCheckBox,
                              QRubberBand, QSystemTrayIcon, QMenu, QAction,
-                             QFileDialog, QSplitter, QTextBrowser)
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPoint, QRect, QSize, QUrl
+                             QFileDialog, QSplitter, QTextBrowser, QGridLayout)
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPoint, QRect, QSize, QUrl, QThread
 from PyQt5.QtGui import QFont, QTextCursor, QColor, QPalette, QPainter, QPen, QDesktopServices, QIcon, QPixmap
 
 import sounddevice as sd
@@ -33,8 +33,9 @@ import numpy as np
 from dotenv import load_dotenv
 from providers import get_provider, PROVIDER_NAMES, TRANSCRIPTION_PROVIDERS, ANSWER_PROVIDERS
 from styles import COLORS, get_stylesheet, apply_theme_palette
-from modern_widgets import ModernButton, ModernInput, ModernToggle, ModernCard, ModernComboBox, ModernDialog
-from languages import get_language_names, get_question_words, get_all_question_words
+from modern_widgets import (ModernButton, ModernInput, ModernToggle, ModernCard,
+                            ModernComboBox, ModernDialog, ModernConfirmDialog)
+from languages import get_language_names, get_question_words, get_all_question_words, get_whisper_code
 from context_manager import (load_context, save_context, parse_resume,
                              build_context_prompt, get_resume_summary, get_jd_summary)
 import screen_capture
@@ -91,7 +92,7 @@ try:
 except ImportError:
     pass  # Falls back to RMS-based VAD
 
-# History and config file paths
+# History and config file paths (JSONL for history: append-only, crash-safe)
 HISTORY_FILE = Path.home() / ".audio_detector_history.json"
 CONFIG_FILE = Path.home() / ".audio_detector_config.json"
 APP_VERSION = "2.0.0"
@@ -107,6 +108,11 @@ API_KEYS = {
     "openai": OPENAI_API_KEY,
     "ollama": None,  # No API key needed
 }
+
+
+def esc(text):
+    """Sanitize text for safe insertion into HTML strings."""
+    return html.escape(str(text)) if text else ""
 
 
 def load_config():
@@ -125,14 +131,16 @@ def load_config():
         "interview_mode": "coding",  # "coding" or "non-coding"
         "show_all_transcriptions": True,
         "overlay_opacity": 0.85,
+        "auto_correct": True,
+        "check_updates": True,
     }
     try:
         if CONFIG_FILE.exists():
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 saved = json.load(f)
             defaults.update(saved)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Config] Warning loading config: {e}")
     return defaults
 
 
@@ -141,10 +149,8 @@ def save_config(config):
     try:
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-# Load env (providers already loaded keys above)
+    except Exception as e:
+        print(f"[Config] Warning saving config: {e}")
 
 # Settings
 SAMPLE_RATE = 16000
@@ -168,8 +174,6 @@ DEFAULT_WHISPER_PROMPT = (
     "algorithm, recursion, sprint, scrum, agile, waterfall"
 )
 
-QUESTION_WORDS = get_all_question_words()
-
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -179,11 +183,11 @@ QUESTION_WORDS = get_all_question_words()
 class WorkerSignals(QObject):
     """Signals for GUI communication"""
     log = pyqtSignal(str, str)
-    question = pyqtSignal(str, str)          # legacy: final Q&A (used for history)
     answer_start = pyqtSignal(str)           # streaming: question text, starts answer block
     answer_token = pyqtSignal(str)           # streaming: one token at a time
     answer_done = pyqtSignal(str, str)       # streaming: final (question, full_answer)
     transcription = pyqtSignal(str, bool)    # live transcript: (text, is_question)
+    stopped = pyqtSignal(str)                # worker status: "stopped" or "error"
 
 
 def is_image_black(img):
@@ -228,7 +232,7 @@ class ScreenAnalysisWorker(QObject):
 class AudioDetectorWorker:
     """Worker for audio processing in a separate thread"""
 
-    def __init__(self, device_index, signals, sample_rate=SAMPLE_RATE, language="Ukrainian", topic="", whisper_prompt="", transcription_provider=None, answer_provider=None, context_prompt="", mode="coding"):
+    def __init__(self, device_index, signals, sample_rate=SAMPLE_RATE, language="Ukrainian", topic="", whisper_prompt="", transcription_provider=None, answer_provider=None, context_prompt="", mode="coding", auto_correct=True):
         self.device_index = device_index
         self.signals = signals
         self.sample_rate = sample_rate
@@ -243,6 +247,8 @@ class AudioDetectorWorker:
         self.context_prompt = context_prompt  # Resume + JD context
         self.mode = mode  # "coding" or "non-coding"
         self.whisper_prompt = whisper_prompt.strip() if whisper_prompt else DEFAULT_WHISPER_PROMPT
+        self.auto_correct = auto_correct
+        self.question_words = set(get_question_words(self.language))
 
         # WebRTC VAD (if available)
         self._vad = None
@@ -283,7 +289,11 @@ class AudioDetectorWorker:
             if self.last_transcription:
                 prev_context = self.last_transcription[-200:]
                 prompt = prev_context + " " + self.whisper_prompt[:100]
-            result = self.transcription_provider.transcribe(wav_buffer, prompt=prompt)
+            result = self.transcription_provider.transcribe(
+                wav_buffer,
+                language=get_whisper_code(self.language),
+                prompt=prompt
+            )
             if result:
                 self.last_transcription = result
             return result
@@ -302,7 +312,6 @@ class AudioDetectorWorker:
             self.signals.log.emit(f"Correction error: {e}", "warning")
             return raw_text
 
-
     def is_question(self, text):
         """Check if transcription is likely a question."""
         if not text or len(text.strip()) < 5:
@@ -311,14 +320,12 @@ class AudioDetectorWorker:
         # Check for question mark
         if text.strip().endswith('?'):
             return True
-        # Check for question words at start of sentence
-        first_word = text_lower.split()[0] if text_lower.split() else ""
-        if first_word in QUESTION_WORDS:
-            return True
-        # Check for question words anywhere (weaker signal, but still useful)
-        words = set(text_lower.split())
-        if words & set(QUESTION_WORDS):
-            return True
+        # Check for question words at start of sentence (scoped to selected language)
+        words = text_lower.split()
+        if words:
+            first_word_clean = re.sub(r'^\W+|\W+$', '', words[0])
+            if first_word_clean in self.question_words:
+                return True
         return False
 
     def answer_question(self, question):
@@ -369,29 +376,19 @@ class AudioDetectorWorker:
             return "Sorry, could not generate an answer."
 
     def _save_to_history(self, question, answer):
-        """Append Q&A to history JSON file (with file locking)."""
+        """Append Q&A to history JSONL file (append-only, crash-safe)."""
         try:
-            history = []
-            if HISTORY_FILE.exists():
-                with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
-                    try:
-                        history = json.load(f)
-                    except json.JSONDecodeError:
-                        history = []  # Corrupted file, start fresh
-            history.append({
+            entry = json.dumps({
                 "timestamp": datetime.now().isoformat(),
                 "question": question,
                 "answer": answer,
                 "language": self.language,
                 "topic": self.topic
-            })
-            # Write atomically: write to temp, then rename
-            tmp_file = HISTORY_FILE.with_suffix('.tmp')
-            with open(tmp_file, 'w', encoding='utf-8') as f:
-                json.dump(history, f, ensure_ascii=False, indent=2)
-            tmp_file.replace(HISTORY_FILE)
-        except Exception:
-            pass  # Don't break detection over history file errors
+            }, ensure_ascii=False)
+            with open(HISTORY_FILE, 'a', encoding='utf-8') as f:
+                f.write(entry + '\n')
+        except Exception as e:
+            print(f"[History] Warning saving to history: {e}")
 
     def has_speech(self, audio_data):
         """Detect speech using WebRTC VAD (preferred) or RMS fallback."""
@@ -402,16 +399,12 @@ class AudioDetectorWorker:
         return rms > SILENCE_THRESHOLD
 
     def _has_speech_webrtcvad(self, audio_data):
-        """WebRTC VAD: check if audio contains speech.
-        webrtcvad requires 16-bit PCM at 8/16/32/48 kHz in 10/20/30ms frames.
-        """
+        """WebRTC VAD: check if audio contains speech."""
         try:
-            # Convert float32 to int16 PCM
             audio_int16 = np.clip(audio_data * 32767, -32768, 32767).astype(np.int16)
             pcm_bytes = audio_int16.tobytes()
-            # Frame size: 30ms at sample_rate
             frame_size = int(self.sample_rate * 0.03)  # 30ms
-            frame_bytes = frame_size * 2  # 16-bit = 2 bytes per sample
+            frame_bytes = frame_size * 2
             speech_frames = 0
             total_frames = 0
             for i in range(0, len(pcm_bytes) - frame_bytes, frame_bytes):
@@ -422,10 +415,8 @@ class AudioDetectorWorker:
                         speech_frames += 1
             if total_frames == 0:
                 return False
-            # Speech if >15% of frames contain speech
             return (speech_frames / total_frames) > 0.15
         except Exception:
-            # Fallback to RMS
             rms = np.sqrt(np.dot(audio_data, audio_data) / len(audio_data))
             return rms > SILENCE_THRESHOLD
 
@@ -437,11 +428,10 @@ class AudioDetectorWorker:
         search_end = buf_len - self._silence_frames
         if search_start >= search_end:
             return None
-        # Use np.dot for faster RMS
         pos = search_start
         sf = self._silence_frames
         wf = self._window_frames
-        threshold_sq = VAD_THRESHOLD * VAD_THRESHOLD  # Compare squares, skip sqrt
+        threshold_sq = VAD_THRESHOLD * VAD_THRESHOLD
         while pos < search_end:
             window = buffer[pos:pos + sf]
             mean_sq = np.dot(window, window) / sf
@@ -459,16 +449,18 @@ class AudioDetectorWorker:
         if not raw_transcription:
             return
         self.signals.log.emit(f"Raw text: {raw_transcription}", "info")
-        transcription = self.correct_transcription(raw_transcription)
-        if transcription != raw_transcription:
-            self.signals.log.emit(f"Corrected: {transcription}", "success")
+        if self.auto_correct:
+            transcription = self.correct_transcription(raw_transcription)
+            if transcription != raw_transcription:
+                self.signals.log.emit(f"Corrected: {transcription}", "success")
+        else:
+            transcription = raw_transcription
         self.signals.log.emit(f"Transcription: {transcription}", "info")
         is_q = self.is_question(transcription)
-        # Emit live transcription for all speech (not just questions)
         self.signals.transcription.emit(transcription, is_q)
         if is_q:
             self.signals.log.emit("Generating answer...", "info")
-            self.answer_question(transcription)  # streaming signals handle UI updates
+            self.answer_question(transcription)
 
     def run(self):
         self.is_running = True
@@ -482,7 +474,6 @@ class AudioDetectorWorker:
                 callback=self.audio_callback,
                 blocksize=int(self.sample_rate * 0.1)
             ):
-                # List instead of np.append — O(1) append instead of O(n) copy
                 buffer_chunks = []
                 buffer_len = 0
 
@@ -493,7 +484,6 @@ class AudioDetectorWorker:
                         buffer_chunks.append(flat)
                         buffer_len += len(flat)
 
-                        # Concatenate only when VAD check is needed
                         if buffer_len >= self._min_frames:
                             buffer = np.concatenate(buffer_chunks)
                             split_point = self.detect_silence_split(buffer)
@@ -512,15 +502,16 @@ class AudioDetectorWorker:
                                 buffer_len = len(rest)
                                 self.process_chunk(chunk)
                             else:
-                                # Keep merged buffer for next iteration
                                 buffer_chunks = [buffer]
                     except queue.Empty:
                         continue
         except Exception as e:
             self.signals.log.emit(f"Error: {e}", "error")
+            self.signals.stopped.emit("error")
         finally:
             self.is_running = False
             self.signals.log.emit("Capture stopped", "info")
+            self.signals.stopped.emit("stopped")
 
     def stop(self):
         self.is_running = False
@@ -533,32 +524,36 @@ class AudioDetectorWorker:
 class HotkeyManager:
     """Global hotkey manager with double-press detection (cross-platform)"""
 
+    DOUBLE_PRESS_THRESHOLD = 0.4
+
     def __init__(self):
-        self.last_f1_time = 0.0
-        self.last_f2_time = 0.0
-        self.last_f3_time = 0.0
-        self.last_f4_time = 0.0
-        self.last_f6_time = 0.0
-        self.last_f7_time = 0.0
-        self.last_f8_time = 0.0
-        self.last_f9_time = 0.0
-        self.last_f10_time = 0.0
-        self.last_f11_time = 0.0
-        self.last_f12_time = 0.0
+        self._key_times = {}
         self.on_double_f1 = None
         self.on_double_f2 = None
         self.on_double_f3 = None
-        self.on_double_f4 = None  # Copy to clipboard
+        self.on_double_f4 = None
+        self.on_double_f5 = None  # Toggle mouse transparency / interactivity
         self.on_double_f6 = None  # Screen capture
         self.on_double_f7 = None  # Opacity up
         self.on_double_f8 = None  # Opacity down
         self.on_double_f9 = None  # Font size up
-        self.on_double_f10 = None  # Font size down
-        self.on_double_f11 = None  # Scroll up
-        self.on_double_f12 = None  # Scroll down
+        self.on_double_f10 = None # Font size down
+        self.on_double_f11 = None # Scroll up
+        self.on_double_f12 = None # Scroll down
         self._thread = None
         self._running = False
-        self._listener = None  # pynput listener (Windows/macOS)
+        self._listener = None
+
+    def _trigger_key(self, name):
+        now = time.time()
+        last_time = self._key_times.get(name, 0.0)
+        if now - last_time < self.DOUBLE_PRESS_THRESHOLD:
+            cb = getattr(self, f"on_double_{name}", None)
+            if cb:
+                cb()
+            self._key_times[name] = 0.0
+        else:
+            self._key_times[name] = now
 
     # ── Linux (evdev) ──
     def _find_keyboards(self):
@@ -584,137 +579,36 @@ class HotkeyManager:
             print("  sudo usermod -aG input $USER", flush=True)
             print("  Then log out and log back in.", flush=True)
             return
-        print(f"[HotkeyManager] Found {len(keyboards)} keyboards. F1x2=hide, F2x2=show, F3x2=quit", flush=True)
+        print(f"[HotkeyManager] Found {len(keyboards)} keyboards active.", flush=True)
         import select as sel
+        
+        # Map evdev codes to key names
+        code_map = {
+            ecodes.KEY_F1: 'f1', ecodes.KEY_F2: 'f2', ecodes.KEY_F3: 'f3',
+            ecodes.KEY_F4: 'f4', ecodes.KEY_F5: 'f5', ecodes.KEY_F6: 'f6',
+            ecodes.KEY_F7: 'f7', ecodes.KEY_F8: 'f8', ecodes.KEY_F9: 'f9',
+            ecodes.KEY_F10: 'f10', ecodes.KEY_F11: 'f11', ecodes.KEY_F12: 'f12'
+        }
+
         while self._running:
             try:
                 r, _, _ = sel.select(keyboards, [], [], 0.1)
                 for device in r:
                     for event in device.read():
                         if event.type == ecodes.EV_KEY and event.value == 1:
-                            self._handle_key_evdev(event.code)
+                            key_name = code_map.get(event.code)
+                            if key_name:
+                                self._trigger_key(key_name)
             except Exception:
                 continue
 
-    def _handle_key_evdev(self, code):
-        """Handle evdev key press (Linux)"""
-        now = time.time()
-        if code == ecodes.KEY_F1:
-            if now - self.last_f1_time < 0.4:
-                if self.on_double_f1: self.on_double_f1()
-                self.last_f1_time = 0.0
-            else: self.last_f1_time = now
-        elif code == ecodes.KEY_F2:
-            if now - self.last_f2_time < 0.4:
-                if self.on_double_f2: self.on_double_f2()
-                self.last_f2_time = 0.0
-            else: self.last_f2_time = now
-        elif code == ecodes.KEY_F3:
-            if now - self.last_f3_time < 0.4:
-                if self.on_double_f3: self.on_double_f3()
-                self.last_f3_time = 0.0
-            else: self.last_f3_time = now
-        elif code == ecodes.KEY_F4:
-            if now - self.last_f4_time < 0.4:
-                if self.on_double_f4: self.on_double_f4()
-                self.last_f4_time = 0.0
-            else: self.last_f4_time = now
-        elif code == ecodes.KEY_F6:
-            if now - self.last_f6_time < 0.4:
-                if self.on_double_f6: self.on_double_f6()
-                self.last_f6_time = 0.0
-            else: self.last_f6_time = now
-        elif code == ecodes.KEY_F7:
-            if now - self.last_f7_time < 0.4:
-                if self.on_double_f7: self.on_double_f7()
-                self.last_f7_time = 0.0
-            else: self.last_f7_time = now
-        elif code == ecodes.KEY_F8:
-            if now - self.last_f8_time < 0.4:
-                if self.on_double_f8: self.on_double_f8()
-                self.last_f8_time = 0.0
-            else: self.last_f8_time = now
-        elif code == ecodes.KEY_F9:
-            if now - self.last_f9_time < 0.4:
-                if self.on_double_f9: self.on_double_f9()
-                self.last_f9_time = 0.0
-            else: self.last_f9_time = now
-        elif code == ecodes.KEY_F10:
-            if now - self.last_f10_time < 0.4:
-                if self.on_double_f10: self.on_double_f10()
-                self.last_f10_time = 0.0
-            else: self.last_f10_time = now
-        elif code == ecodes.KEY_F11:
-            if now - self.last_f11_time < 0.4:
-                if self.on_double_f11: self.on_double_f11()
-                self.last_f11_time = 0.0
-            else: self.last_f11_time = now
-        elif code == ecodes.KEY_F12:
-            if now - self.last_f12_time < 0.4:
-                if self.on_double_f12: self.on_double_f12()
-                self.last_f12_time = 0.0
-            else: self.last_f12_time = now
-
-    # ── Windows (pynput) ──
+    # ── Windows / macOS (pynput) ──
     def _on_key_press_pynput(self, key):
         """Handle pynput key press (Windows/macOS)"""
-        now = time.time()
         try:
-            if key == pynput_keyboard.Key.f1:
-                if now - self.last_f1_time < 0.4:
-                    if self.on_double_f1: self.on_double_f1()
-                    self.last_f1_time = 0.0
-                else: self.last_f1_time = now
-            elif key == pynput_keyboard.Key.f2:
-                if now - self.last_f2_time < 0.4:
-                    if self.on_double_f2: self.on_double_f2()
-                    self.last_f2_time = 0.0
-                else: self.last_f2_time = now
-            elif key == pynput_keyboard.Key.f3:
-                if now - self.last_f3_time < 0.4:
-                    if self.on_double_f3: self.on_double_f3()
-                    self.last_f3_time = 0.0
-                else: self.last_f3_time = now
-            elif key == pynput_keyboard.Key.f4:
-                if now - self.last_f4_time < 0.4:
-                    if self.on_double_f4: self.on_double_f4()
-                    self.last_f4_time = 0.0
-                else: self.last_f4_time = now
-            elif key == pynput_keyboard.Key.f6:
-                if now - self.last_f6_time < 0.4:
-                    if self.on_double_f6: self.on_double_f6()
-                    self.last_f6_time = 0.0
-                else: self.last_f6_time = now
-            elif key == pynput_keyboard.Key.f7:
-                if now - self.last_f7_time < 0.4:
-                    if self.on_double_f7: self.on_double_f7()
-                    self.last_f7_time = 0.0
-                else: self.last_f7_time = now
-            elif key == pynput_keyboard.Key.f8:
-                if now - self.last_f8_time < 0.4:
-                    if self.on_double_f8: self.on_double_f8()
-                    self.last_f8_time = 0.0
-                else: self.last_f8_time = now
-            elif key == pynput_keyboard.Key.f9:
-                if now - self.last_f9_time < 0.4:
-                    if self.on_double_f9: self.on_double_f9()
-                    self.last_f9_time = 0.0
-                else: self.last_f9_time = now
-            elif key == pynput_keyboard.Key.f10:
-                if now - self.last_f10_time < 0.4:
-                    if self.on_double_f10: self.on_double_f10()
-                    self.last_f10_time = 0.0
-                else: self.last_f10_time = now
-            elif key == pynput_keyboard.Key.f11:
-                if now - self.last_f11_time < 0.4:
-                    if self.on_double_f11: self.on_double_f11()
-                    self.last_f11_time = 0.0
-                else: self.last_f11_time = now
-            elif key == pynput_keyboard.Key.f12:
-                if now - self.last_f12_time < 0.4:
-                    if self.on_double_f12: self.on_double_f12()
-                    self.last_f12_time = 0.0
-                else: self.last_f12_time = now
+            name = key.name if hasattr(key, 'name') else str(key)
+            if name and name.startswith('f'):
+                self._trigger_key(name)
         except AttributeError:
             pass
 
@@ -728,7 +622,7 @@ class HotkeyManager:
             self._listener = pynput_keyboard.Listener(on_press=self._on_key_press_pynput)
             self._listener.daemon = True
             self._listener.start()
-            print("[HotkeyManager] pynput listener started. F1-F4, F9-F10 hotkeys active", flush=True)
+            print("[HotkeyManager] pynput listener started.", flush=True)
 
     def stop(self):
         self._running = False
@@ -747,11 +641,13 @@ def get_audio_sources():
     if IS_LINUX:
         return _get_audio_sources_linux()
     else:
-        # Windows and macOS both use sounddevice
         return _get_audio_sources_windows()
 
 def _get_audio_sources_linux():
     """Linux: get sources via pactl"""
+    if not shutil.which('pactl'):
+        print("[Audio] pactl command not found. Please install pulseaudio-utils or pipewire-pulse.")
+        return []
     monitor_devices = []
     input_devices = []
     try:
@@ -784,7 +680,6 @@ def _get_audio_sources_windows():
         for i, dev in enumerate(sd.query_devices()):
             if dev['max_input_channels'] > 0:
                 name = dev['name']
-                # Prefer loopback/stereo mix for system audio
                 if any(kw in name.lower() for kw in ['stereo mix', 'loopback', 'what u hear']):
                     devices.insert(0, (f"System Audio ({name})", i))
                 else:
@@ -806,18 +701,19 @@ class ScreenSelector(QWidget):
         self.current_pos = QPoint()
         self.is_selecting = False
         
-        # Cover the entire virtual desktop for multi-monitor support
-        self.setGeometry(QApplication.desktop().geometry())
+        # Cover virtual desktop across monitors
+        screen = QApplication.primaryScreen()
+        if screen:
+            self.setGeometry(screen.virtualGeometry())
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        # Semi-transparent dark background
         painter.fillRect(self.rect(), QColor(15, 15, 15, 180))
 
-        # Instructions banner at the top-center
         painter.setRenderHint(QPainter.Antialiasing)
         instructions = "Drag a box around the question | Escape/Right-click to Cancel"
-        font = QFont("Segoe UI", 12, QFont.DemiBold)
+        font_family = "Segoe UI" if IS_WINDOWS else ("SF Pro" if IS_MACOS else "Cantarell")
+        font = QFont(font_family, 12, QFont.DemiBold)
         painter.setFont(font)
         metrics = painter.fontMetrics()
         w = metrics.horizontalAdvance(instructions) + 40
@@ -835,18 +731,15 @@ class ScreenSelector(QWidget):
         if self.is_selecting and not self.start_pos.isNull() and not self.current_pos.isNull():
             rect = QRect(self.start_pos, self.current_pos).normalized()
             
-            # Punch a hole in the overlay
             painter.setCompositionMode(QPainter.CompositionMode_Clear)
             painter.fillRect(rect, Qt.transparent)
             painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
             
-            # Draw premium border
             painter.setPen(QPen(QColor("#0A84FF"), 2))
             painter.drawRect(rect)
             
-            # Draw size text box
             size_text = f"{rect.width()} x {rect.height()}"
-            font_size = QFont("Segoe UI", 9)
+            font_size = QFont(font_family, 9)
             painter.setFont(font_size)
             sz_metrics = painter.fontMetrics()
             sz_w = sz_metrics.horizontalAdvance(size_text) + 16
@@ -960,9 +853,11 @@ class AreaSelectionWindow(QWidget):
 
 class ConfigWindow(QWidget):
     """Configuration window — application entry point"""
+    update_available = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
+        self.setObjectName("ConfigWindow")
         self.config = load_config()
         self.user_context = load_context()  # Resume + JD
         self.audio_sources = get_audio_sources()
@@ -974,30 +869,31 @@ class ConfigWindow(QWidget):
         self.setup_tray()
         # Wire update signal to handler
         self.update_available.connect(self.on_update_available)
-        self.check_for_updates()
+        if self.config.get("check_updates", True):
+            self.check_for_updates()
 
     def init_ui(self):
         self.setWindowTitle("Audio Question Detector — Settings")
-        self.setMinimumSize(520, 820) # Taller to accommodate new controls
+        self.setMinimumSize(520, 900)
         self.theme = self.config.get("theme", "dark")
         
         # Center on screen
         screen = QApplication.primaryScreen().geometry()
         x = (screen.width() - 520) // 2
-        y = (screen.height() - 820) // 2
+        y = (screen.height() - 900) // 2
         self.move(x, y)
         
         # Apply base stylesheet
         self.setStyleSheet(get_stylesheet(self.theme))
 
         main_layout = QVBoxLayout()
-        main_layout.setSpacing(20)
-        main_layout.setContentsMargins(30, 30, 30, 30)
+        main_layout.setSpacing(15)
+        main_layout.setContentsMargins(24, 24, 24, 24)
         self.setLayout(main_layout)
 
         # Header
         header = QHBoxLayout()
-        title = QLabel(f"Audio Detector")
+        title = QLabel("Audio Detector")
         title.setObjectName("Title")
         subtitle = QLabel(f"v{APP_VERSION}")
         subtitle.setObjectName("Subtitle")
@@ -1016,8 +912,8 @@ class ConfigWindow(QWidget):
         # Settings Card
         self.settings_card = ModernCard(self.theme)
         card_layout = QVBoxLayout()
-        card_layout.setSpacing(15)
-        card_layout.setContentsMargins(20, 20, 20, 20)
+        card_layout.setSpacing(12)
+        card_layout.setContentsMargins(20, 16, 20, 20)
         self.settings_card.setLayout(card_layout)
 
         # 1. Device Selection
@@ -1026,8 +922,8 @@ class ConfigWindow(QWidget):
         card_layout.addWidget(lbl)
         
         source_row = QHBoxLayout()
+        source_row.setContentsMargins(0, 0, 0, 0)
         self.source_combo = ModernComboBox(self.theme)
-        # self.source_combo.setFixedHeight(36) # Handled by widget
         source_row.addWidget(self.source_combo)
         
         refresh_btn = ModernButton("↻", self.theme)
@@ -1038,24 +934,28 @@ class ConfigWindow(QWidget):
 
         # 2. Interview Mode & Language Row
         row2 = QHBoxLayout()
+        row2.setContentsMargins(0, 0, 0, 0)
+        row2.setSpacing(12)
         
         # Interview Mode (Coding / Non-Coding)
         mode_layout = QVBoxLayout()
+        mode_layout.setContentsMargins(0, 0, 0, 0)
+        mode_layout.setSpacing(6)
         mode_lbl = QLabel("Interview Type")
         mode_lbl.setObjectName("Subtitle")
         mode_layout.addWidget(mode_lbl)
         
-        interview_mode_row = QHBoxLayout()
         self.interview_mode_combo = ModernComboBox(self.theme)
         self.interview_mode_combo.addItems(["Coding", "Non-Coding"])
         saved_interview_mode = self.config.get("interview_mode", "coding")
         self.interview_mode_combo.setCurrentText(saved_interview_mode.capitalize())
-        interview_mode_row.addWidget(self.interview_mode_combo)
-        mode_layout.addLayout(interview_mode_row)
+        mode_layout.addWidget(self.interview_mode_combo)
         row2.addLayout(mode_layout)
 
         # Display Mode
         dmode_layout = QVBoxLayout()
+        dmode_layout.setContentsMargins(0, 0, 0, 0)
+        dmode_layout.setSpacing(6)
         dmode_lbl = QLabel("Display")
         dmode_lbl.setObjectName("Subtitle")
         dmode_layout.addWidget(dmode_lbl)
@@ -1064,8 +964,10 @@ class ConfigWindow(QWidget):
         dmode_layout.addWidget(self.mode_combo)
         row2.addLayout(dmode_layout)
         
-        # Language (now 52 languages)
+        # Language
         lang_layout = QVBoxLayout()
+        lang_layout.setContentsMargins(0, 0, 0, 0)
+        lang_layout.setSpacing(6)
         lang_lbl = QLabel("Language")
         lang_lbl.setObjectName("Subtitle")
         lang_layout.addWidget(lang_lbl)
@@ -1075,7 +977,7 @@ class ConfigWindow(QWidget):
         saved_lang = self.config.get("language", "English")
         if saved_lang in langs:
             self.lang_combo.setCurrentText(saved_lang)
-        self.lang_combo.setEditable(True)  # Type-to-filter
+        self.lang_combo.setEditable(True)
         self.lang_combo.setInsertPolicy(QComboBox.NoInsert)
         lang_layout.addWidget(self.lang_combo)
         row2.addLayout(lang_layout)
@@ -1084,9 +986,13 @@ class ConfigWindow(QWidget):
 
         # 3. AI Provider Row
         row3 = QHBoxLayout()
+        row3.setContentsMargins(0, 0, 0, 0)
+        row3.setSpacing(12)
 
         # Transcription Provider
         tp_layout = QVBoxLayout()
+        tp_layout.setContentsMargins(0, 0, 0, 0)
+        tp_layout.setSpacing(6)
         tp_lbl = QLabel("Transcription")
         tp_lbl.setObjectName("Subtitle")
         tp_layout.addWidget(tp_lbl)
@@ -1102,6 +1008,8 @@ class ConfigWindow(QWidget):
 
         # Answer Provider
         ap_layout = QVBoxLayout()
+        ap_layout.setContentsMargins(0, 0, 0, 0)
+        ap_layout.setSpacing(6)
         ap_lbl = QLabel("Answers")
         ap_lbl.setObjectName("Subtitle")
         ap_layout.addWidget(ap_lbl)
@@ -1146,6 +1054,7 @@ class ConfigWindow(QWidget):
         card_layout.addWidget(context_lbl)
 
         resume_row = QHBoxLayout()
+        resume_row.setContentsMargins(0, 0, 0, 0)
         self.resume_btn = ModernButton("Upload Resume", self.theme)
         self.resume_btn.clicked.connect(self.upload_resume)
         resume_row.addWidget(self.resume_btn)
@@ -1159,19 +1068,33 @@ class ConfigWindow(QWidget):
         self.jd_input.setText(self.user_context.get("job_description", ""))
         card_layout.addWidget(self.jd_input)
 
-        # 7. Minimize to tray toggle
+        # 7. Checkboxes in 2x2 Grid Layout
+        checkbox_grid = QGridLayout()
+        checkbox_grid.setContentsMargins(0, 0, 0, 0)
+        checkbox_grid.setHorizontalSpacing(24)
+        checkbox_grid.setVerticalSpacing(12)
+
         self.tray_toggle = QCheckBox("Minimize to tray on close")
         self.tray_toggle.setChecked(self.config.get("minimize_to_tray", True))
         self.tray_toggle.stateChanged.connect(self._on_tray_toggle)
-        card_layout.addWidget(self.tray_toggle)
+        checkbox_grid.addWidget(self.tray_toggle, 0, 0)
 
-        # 8. Show all transcriptions toggle
-        self.show_transcriptions_toggle = QCheckBox("Show all transcriptions (live transcript)")
+        self.show_transcriptions_toggle = QCheckBox("Show live transcript")
         self.show_transcriptions_toggle.setChecked(self.config.get("show_all_transcriptions", True))
-        card_layout.addWidget(self.show_transcriptions_toggle)
+        checkbox_grid.addWidget(self.show_transcriptions_toggle, 0, 1)
+
+        self.auto_correct_toggle = QCheckBox("Auto-correct transcriptions")
+        self.auto_correct_toggle.setChecked(self.config.get("auto_correct", True))
+        checkbox_grid.addWidget(self.auto_correct_toggle, 1, 0)
+
+        self.check_updates_toggle = QCheckBox("Check updates on startup")
+        self.check_updates_toggle.setChecked(self.config.get("check_updates", True))
+        checkbox_grid.addWidget(self.check_updates_toggle, 1, 1)
+
+        card_layout.addStretch()
+        card_layout.addLayout(checkbox_grid)
 
         main_layout.addWidget(self.settings_card)
-        main_layout.addStretch()
 
         # Action Buttons
         self.start_btn = ModernButton("Start Detection", self.theme, accent=True)
@@ -1201,14 +1124,8 @@ class ConfigWindow(QWidget):
     def apply_theme(self, theme):
         """Update theme for window and all modern widgets"""
         self.theme = theme
-
-        # 1. Global palette + app-level stylesheet
         apply_theme_palette(QApplication.instance(), theme)
-
-        # 2. Re-apply this window's own stylesheet so background/labels update
         self.setStyleSheet(get_stylesheet(theme))
-
-        # 3. Walk every child that has a 'theme' attr and refresh it
         for child in self.findChildren(QWidget):
             if hasattr(child, "theme"):
                 child.theme = theme
@@ -1218,7 +1135,6 @@ class ConfigWindow(QWidget):
                     child.update()
 
     def toggle_theme(self, state):
-        # State can be checked (2) or unchecked (0) if from stateChanged
         checked = self.theme_toggle.isChecked()
         theme = "light" if checked else "dark"
         self.config["theme"] = theme
@@ -1242,14 +1158,10 @@ class ConfigWindow(QWidget):
                     latest_tag = data.get("tag_name", "").lstrip("v")
                     if latest_tag and latest_tag != APP_VERSION:
                         self.update_available.emit(latest_tag)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[UpdateCheck] Error checking updates: {e}")
         
-        # Simple threading to not block UI
         threading.Thread(target=check, daemon=True).start()
-
-    # Signal for update (hacky way to run on main thread)
-    update_available = pyqtSignal(str)
 
     def on_update_available(self, version):
         ModernDialog(
@@ -1309,6 +1221,8 @@ class ConfigWindow(QWidget):
         whisper_prompt = self.whisper_input.text().strip()
         interview_mode = self.interview_mode_combo.currentText().lower().replace("-", "_")
         show_all_transcriptions = self.show_transcriptions_toggle.isChecked()
+        auto_correct = self.auto_correct_toggle.isChecked()
+        check_updates = self.check_updates_toggle.isChecked()
 
         # Save JD to context
         jd_text = self.jd_input.text().strip()
@@ -1332,6 +1246,8 @@ class ConfigWindow(QWidget):
             "answer_provider": ap_key,
             "interview_mode": interview_mode,
             "show_all_transcriptions": show_all_transcriptions,
+            "auto_correct": auto_correct,
+            "check_updates": check_updates,
         })
         save_config(self.config)
 
@@ -1355,7 +1271,8 @@ class ConfigWindow(QWidget):
                 device_index, sample_rate, self, language, topic,
                 self.config.get("theme", "dark"), whisper_prompt, tp, ap,
                 context_prompt=context_prompt, interview_mode=interview_mode,
-                show_all_transcriptions=show_all_transcriptions
+                show_all_transcriptions=show_all_transcriptions,
+                auto_correct=auto_correct
             )
             self.test_window.show()
         else:
@@ -1363,7 +1280,7 @@ class ConfigWindow(QWidget):
             self.overlay_window = OverlayWindow(
                 device_index, sample_rate, self, language, topic,
                 self.config, tp, ap, context_prompt=context_prompt,
-                interview_mode=interview_mode
+                interview_mode=interview_mode, auto_correct=auto_correct
             )
             self.overlay_window.show()
 
@@ -1519,7 +1436,7 @@ class ConfigWindow(QWidget):
 class TestModeWindow(QMainWindow):
     """Test Mode — standard window with log, live transcript, and answers"""
 
-    def __init__(self, device_index, sample_rate, config_window, language="English", topic="", theme="dark", whisper_prompt="", transcription_provider=None, answer_provider=None, context_prompt="", interview_mode="coding", show_all_transcriptions=True):
+    def __init__(self, device_index, sample_rate, config_window, language="English", topic="", theme="dark", whisper_prompt="", transcription_provider=None, answer_provider=None, context_prompt="", interview_mode="coding", show_all_transcriptions=True, auto_correct=True):
         super().__init__()
         self.config_window = config_window
         self.device_index = device_index
@@ -1533,6 +1450,7 @@ class TestModeWindow(QMainWindow):
         self.context_prompt = context_prompt
         self.interview_mode = interview_mode
         self.show_all_transcriptions = show_all_transcriptions
+        self.auto_correct = auto_correct
         self.worker = None
         self.worker_thread = None
         self.init_ui()
@@ -1593,7 +1511,7 @@ class TestModeWindow(QMainWindow):
         log_group.setLayout(log_layout)
         layout.addWidget(log_group)
 
-        # Live Transcript (new!)
+        # Live Transcript
         if self.show_all_transcriptions:
             transcript_group = QGroupBox("Live Transcript")
             transcript_layout = QVBoxLayout()
@@ -1677,7 +1595,7 @@ class TestModeWindow(QMainWindow):
     def log_message(self, message, level="info"):
         colors = {"info": "#b0b0b0", "success": "#4CAF50", "warning": "#FF9800", "error": "#f44336"}
         color = colors.get(level, "#b0b0b0")
-        self.log_text.append(f'<span style="color: {color};">{message}</span>')
+        self.log_text.append(f'<span style="color: {color};">{esc(message)}</span>')
         self.log_text.moveCursor(QTextCursor.End)
 
     def on_transcription(self, text, is_question):
@@ -1692,7 +1610,7 @@ class TestModeWindow(QMainWindow):
             color = c['text_secondary']
             prefix = ""
         self.transcript_text.append(
-            f'<span style="color: {color};">{prefix}{text}</span>'
+            f'<span style="color: {color};">{prefix}{esc(text)}</span>'
         )
         self.transcript_text.moveCursor(QTextCursor.End)
 
@@ -1703,23 +1621,24 @@ class TestModeWindow(QMainWindow):
         a_bg = c['card']
         self.qa_text.append(
             f'<div style="background-color: {q_bg}; padding: 10px; margin: 5px; border-radius: 6px; border: 1px solid {c["border"]};">' 
-            f'<b style="color: {c["accent"]};">TEXT:</b> <span style="color: {c["text_primary"]};">{question}</span></div>'
+            f'<b style="color: {c["accent"]};">TEXT:</b> <span style="color: {c["text_primary"]};">{esc(question)}</span></div>'
         )
         self.qa_text.append(
             f'<div style="background-color: {a_bg}; padding: 10px; margin: 5px; border-radius: 6px; border: 1px solid {c["border"]};">' 
-            f'<b style="color: {c["success"]};">ANSWER:</b> <span style="color: {c["text_primary"]};">{answer}</span></div><br>'
+            f'<b style="color: {c["success"]};">ANSWER:</b> <span style="color: {c["text_primary"]};">{esc(answer)}</span></div><br>'
         )
         self.qa_text.moveCursor(QTextCursor.End)
 
     def on_answer_start(self, question):
         """Streaming: prepare question block, start empty answer"""
+        self.status_label.setText("Processing...")
+        self.status_label.setStyleSheet("color: #FF9800; font-size: 14px; font-weight: bold;")
         c = COLORS[self.theme]
         q_bg = c['input_bg']
         self.qa_text.append(
             f'<div style="background-color: {q_bg}; padding: 10px; margin: 5px; border-radius: 6px; border: 1px solid {c["border"]};">' 
-            f'<b style="color: {c["accent"]};">TEXT:</b> <span style="color: {c["text_primary"]};">{question}</span></div>'
+            f'<b style="color: {c["accent"]};">TEXT:</b> <span style="color: {c["text_primary"]};">{esc(question)}</span></div>'
         )
-        # Start answer block with label
         c2 = COLORS[self.theme]
         a_bg = c2['card']
         self.qa_text.append(
@@ -1732,7 +1651,6 @@ class TestModeWindow(QMainWindow):
     def on_answer_token(self, token):
         """Streaming: append one token to current answer"""
         self._streaming_answer += token
-        # Insert token at cursor position (end of document)
         cursor = self.qa_text.textCursor()
         cursor.movePosition(QTextCursor.End)
         cursor.insertText(token)
@@ -1741,7 +1659,8 @@ class TestModeWindow(QMainWindow):
 
     def on_answer_done(self, question, answer):
         """Streaming: finalize answer block"""
-        # Close the open HTML tags
+        self.status_label.setText("Listening...")
+        self.status_label.setStyleSheet("color: #4CAF50; font-size: 14px; font-weight: bold;")
         cursor = self.qa_text.textCursor()
         cursor.movePosition(QTextCursor.End)
         cursor.insertHtml('</span></div><br>')
@@ -1753,15 +1672,12 @@ class TestModeWindow(QMainWindow):
             self.log_message("Screen capture not available. Install: pip install mss Pillow", "error")
             return
 
-        # Use answer_provider for vision (if supported)
         provider = self.answer_provider
         if not provider or not provider.supports_vision():
             self.log_message("Vision provider not available. Use OpenAI or Groq provider.", "error")
             return
 
         self.log_message("Please select the region to analyze...", "info")
-        
-        # Hide TestModeWindow temporarily
         self.hide()
         QTimer.singleShot(300, lambda: self._launch_selector_test(provider))
 
@@ -1779,7 +1695,8 @@ class TestModeWindow(QMainWindow):
 
             self.log_message(f"Screenshot region captured ({img.size[0]}x{img.size[1]}). Analyzing...", "success")
 
-            # Analyze async using thread-safe QObject worker & signals
+            # Clean thread handling via QThread
+            self.analysis_thread = QThread()
             self.analysis_worker = ScreenAnalysisWorker(
                 provider=provider,
                 img=img,
@@ -1787,27 +1704,36 @@ class TestModeWindow(QMainWindow):
                 mode=self.interview_mode,
                 topic=self.topic
             )
-            self.analysis_worker.sig_start.connect(self.on_answer_start)
-            self.analysis_worker.sig_token.connect(self.on_answer_token)
-            self.analysis_worker.sig_done.connect(self.on_answer_done)
-
-            self.analysis_thread = threading.Thread(target=self.analysis_worker.run, daemon=True)
+            self.analysis_worker.moveToThread(self.analysis_thread)
+            self.analysis_worker.sig_start.connect(self.on_answer_start, Qt.QueuedConnection)
+            self.analysis_worker.sig_token.connect(self.on_answer_token, Qt.QueuedConnection)
+            self.analysis_worker.sig_done.connect(self.on_answer_done, Qt.QueuedConnection)
+            self.analysis_worker.sig_done.connect(self.analysis_thread.quit, Qt.QueuedConnection)
+            self.analysis_thread.started.connect(self.analysis_worker.run)
             self.analysis_thread.start()
 
+    def on_worker_stopped(self, status):
+        if status == "error":
+            self.status_label.setText("Error / Stopped")
+            self.status_label.setStyleSheet("color: #f44336; font-size: 14px; font-weight: bold;")
+        else:
+            self.status_label.setText("Stopped")
+            self.status_label.setStyleSheet("color: #8E8E93; font-size: 14px; font-weight: bold;")
 
     def start_detection(self):
         signals = WorkerSignals()
-        signals.log.connect(self.log_message)
-        signals.question.connect(self.add_qa)
-        signals.answer_start.connect(self.on_answer_start)
-        signals.answer_token.connect(self.on_answer_token)
-        signals.answer_done.connect(self.on_answer_done)
-        signals.transcription.connect(self.on_transcription)
+        signals.log.connect(self.log_message, Qt.QueuedConnection)
+        signals.answer_start.connect(self.on_answer_start, Qt.QueuedConnection)
+        signals.answer_token.connect(self.on_answer_token, Qt.QueuedConnection)
+        signals.answer_done.connect(self.on_answer_done, Qt.QueuedConnection)
+        signals.transcription.connect(self.on_transcription, Qt.QueuedConnection)
+        signals.stopped.connect(self.on_worker_stopped, Qt.QueuedConnection)
+
         self.worker = AudioDetectorWorker(
             self.device_index, signals, self.sample_rate, self.language,
             self.topic, self.whisper_prompt, self.transcription_provider,
             self.answer_provider, context_prompt=self.context_prompt,
-            mode=self.interview_mode
+            mode=self.interview_mode, auto_correct=self.auto_correct
         )
         self.worker_thread = threading.Thread(target=self.worker.run, daemon=True)
         self.worker_thread.start()
@@ -1839,12 +1765,12 @@ class TestModeWindow(QMainWindow):
 class OverlayWindow(QWidget):
     """Overlay Mode — transparent fullscreen window with stealth features"""
 
-    # Signals for thread-safe GUI updates
     sig_hide = pyqtSignal()
     sig_show = pyqtSignal()
 
-    def __init__(self, device_index, sample_rate, config_window, language="English", topic="", config=None, transcription_provider=None, answer_provider=None, context_prompt="", interview_mode="coding"):
+    def __init__(self, device_index, sample_rate, config_window, language="English", topic="", config=None, transcription_provider=None, answer_provider=None, context_prompt="", interview_mode="coding", auto_correct=True):
         super().__init__()
+        self.setObjectName("OverlayWindow")
         self.config_window = config_window
         self.device_index = device_index
         self.sample_rate = sample_rate
@@ -1855,24 +1781,30 @@ class OverlayWindow(QWidget):
         self.answer_provider = answer_provider
         self.context_prompt = context_prompt
         self.interview_mode = interview_mode
+        self.auto_correct = auto_correct
         self.worker = None
         self.worker_thread = None
         self.hotkey_manager = None
         self.is_silent = False
-        self._pending_action = None
-        self.last_answer = ""  # For clipboard copy
+        self.is_interactive = False  # Toggle mouse input pass-through (F5)
+        self._action_queue = queue.Queue()  # Thread-safe queue for hotkey actions
+        self.last_answer = ""
         self.overlay_font_size = self.config.get("font_size", 16)
         self.overlay_opacity = self.config.get("overlay_opacity", 0.85)
+        self._qa_count = 0
         
-        # Current answer being streamed
         self.current_question = ""
         self.current_answer = ""
 
-        # Signals for thread-safe updates
-        self.sig_hide.connect(self._go_silent)
-        self.sig_show.connect(self._restore)
+        # Config save debouncer (500ms)
+        self._config_save_timer = QTimer()
+        self._config_save_timer.setSingleShot(True)
+        self._config_save_timer.setInterval(500)
+        self._config_save_timer.timeout.connect(lambda: save_config(self.config))
 
-        # Process name masking (stealth)
+        self.sig_hide.connect(self._go_silent, Qt.QueuedConnection)
+        self.sig_show.connect(self._restore, Qt.QueuedConnection)
+
         if SETPROCTITLE_AVAILABLE:
             setproctitle.setproctitle("System Service")
 
@@ -1880,56 +1812,49 @@ class OverlayWindow(QWidget):
         self.setup_stealth()
         self.setup_hotkeys()
 
-        # QTimer to check hotkey state (thread-safe)
         self._poll_timer = QTimer()
         self._poll_timer.timeout.connect(self._poll_hotkey_action)
-        self._poll_timer.start(100)  # Check every 100ms
+        self._poll_timer.start(100)
 
-        # Auto-start
         QTimer.singleShot(200, self.start_detection)
 
     def init_ui(self):
-        # Frameless, always-on-top, hidden from taskbar
-        self.setWindowFlags(
-            Qt.WindowStaysOnTopHint |
-            Qt.FramelessWindowHint |
-            Qt.WindowTransparentForInput |  # Mouse clicks pass through
-            Qt.Tool  # Hide from taskbar
-        )
+        flags = Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool
+        if not self.is_interactive:
+            flags |= Qt.WindowTransparentForInput
+        self.setWindowFlags(flags)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowOpacity(self.overlay_opacity)
-        self.setWindowTitle("")  # Empty title for stealth
+        self.setWindowTitle("")
 
-        # Fullscreen or Custom Area
         geometry = self.config.get("overlay_geometry")
         if geometry:
             self.setGeometry(QRect(*geometry))
         else:
-            self.setGeometry(QApplication.primaryScreen().geometry())
+            screen = QApplication.primaryScreen()
+            if screen:
+                self.setGeometry(screen.geometry())
 
-        # Layout
         layout = QVBoxLayout()
         layout.setContentsMargins(40, 40, 40, 40)
         self.setLayout(layout)
 
-        # Answer display
         self.text_display = QTextEdit()
         self.text_display.setReadOnly(True)
-        self.text_display.setStyleSheet("""
-            QTextEdit {
+        self.text_display.setStyleSheet(f"""
+            QTextEdit {{
                 background-color: rgba(15, 15, 15, 180);
                 color: #e0e0e0;
                 border: none;
                 border-radius: 10px;
                 padding: 20px;
                 font-family: 'Arial', 'Helvetica', sans-serif;
-                font-size: 16px;
+                font-size: {self.overlay_font_size}px;
                 line-height: 1.6;
-            }
+            }}
         """)
         layout.addWidget(self.text_display)
 
-        # Compact live transcript line (fades after 5s)
         self.transcript_label = QLabel("")
         self.transcript_label.setStyleSheet("""
             QLabel {
@@ -1942,106 +1867,68 @@ class OverlayWindow(QWidget):
         self.transcript_label.setMaximumHeight(30)
         layout.insertWidget(0, self.transcript_label)
 
-        # Timer to fade transcript
         self._transcript_timer = QTimer()
         self._transcript_timer.setSingleShot(True)
         self._transcript_timer.timeout.connect(lambda: self.transcript_label.setText(""))
 
     def setup_stealth(self):
-        """Platform-aware stealth mode.
-        Linux: Qt window flags only (no API to exclude from screen capture).
-        Windows: SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE).
-        macOS: NSWindow.sharingType = .none (macOS 12+).
-        """
         if IS_WINDOWS:
             QTimer.singleShot(500, self._apply_win32_stealth)
         elif IS_MACOS:
             QTimer.singleShot(500, self._apply_macos_stealth)
-        else:
-            print("[Stealth] Qt window flags applied (Tool + Frameless + TransparentForInput)")
-            print("[Stealth] ⚠ Overlay IS visible in screen sharing on Linux.")
-            print("[Stealth] Workaround: share a specific window, not the entire screen.")
 
     def _apply_win32_stealth(self):
-        """Windows: SetWindowDisplayAffinity to exclude from screen capture."""
         if not WIN32_AVAILABLE:
-            print("[Stealth] Win32 API not available")
             return
         try:
             hwnd = int(self.winId())
             result = user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
-            if result:
-                print("[Stealth] SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) — overlay invisible to capture")
-            else:
-                WDA_MONITOR = 0x00000001
-                result = user32.SetWindowDisplayAffinity(hwnd, WDA_MONITOR)
-                if result:
-                    print("[Stealth] SetWindowDisplayAffinity(WDA_MONITOR) — overlay shows black in capture")
-                else:
-                    print(f"[Stealth] SetWindowDisplayAffinity failed")
+            if not result:
+                user32.SetWindowDisplayAffinity(hwnd, 0x00000001)
         except Exception as e:
             print(f"[Stealth] Win32 stealth error: {e}")
 
     def _apply_macos_stealth(self):
-        """macOS: NSWindow.sharingType = .none to exclude from screen capture.
-        Available on macOS 12.0+ (Monterey). Makes the window invisible to
-        screenshots, screen recording, AirPlay, and screen sharing apps.
-        """
         if not OBJC_AVAILABLE:
-            print("[Stealth] PyObjC not available. Install: pip install pyobjc-framework-Cocoa")
             return
         try:
-            # Get the native NSWindow from Qt's window handle
+            qt_wid = int(self.winId())
             ns_app = NSApplication.sharedApplication()
             for ns_window in ns_app.windows():
-                # Match by window title or find the frameless fullscreen one
-                frame = ns_window.frame()
-                if frame.size.width > 100 and frame.size.height > 100:
-                    # sharingType 0 = NSWindowSharingNone (macOS 12+)
+                if hasattr(ns_window, 'windowNumber') and ns_window.windowNumber() == qt_wid:
                     if hasattr(ns_window, 'setSharingType_'):
-                        ns_window.setSharingType_(0)  # NSWindowSharingNone
-                        print("[Stealth] NSWindow.sharingType = .none — overlay invisible to capture")
+                        ns_window.setSharingType_(0)
                         return
-            print("[Stealth] Could not find NSWindow to apply sharingType")
         except Exception as e:
             print(f"[Stealth] macOS stealth error: {e}")
 
     def setup_hotkeys(self):
-        """Set up global hotkeys"""
         if not (EVDEV_AVAILABLE or PYNPUT_AVAILABLE):
             return
         self.hotkey_manager = HotkeyManager()
-        self.hotkey_manager.on_double_f1 = self._request_hide
-        self.hotkey_manager.on_double_f2 = self._request_show
-        self.hotkey_manager.on_double_f3 = self._request_kill
-        self.hotkey_manager.on_double_f4 = self._request_copy
-        self.hotkey_manager.on_double_f6 = self._request_capture
-        self.hotkey_manager.on_double_f7 = self._request_opacity_up
-        self.hotkey_manager.on_double_f8 = self._request_opacity_down
-        self.hotkey_manager.on_double_f9 = self._request_font_up
-        self.hotkey_manager.on_double_f10 = self._request_font_down
-        self.hotkey_manager.on_double_f11 = self._request_scroll_up
-        self.hotkey_manager.on_double_f12 = self._request_scroll_down
+        self.hotkey_manager.on_double_f1 = lambda: self._action_queue.put('hide')
+        self.hotkey_manager.on_double_f2 = lambda: self._action_queue.put('show')
+        self.hotkey_manager.on_double_f3 = lambda: self._action_queue.put('kill')
+        self.hotkey_manager.on_double_f4 = lambda: self._action_queue.put('copy')
+        self.hotkey_manager.on_double_f5 = lambda: self._action_queue.put('toggle_interactive')
+        self.hotkey_manager.on_double_f6 = lambda: self._action_queue.put('capture')
+        self.hotkey_manager.on_double_f7 = lambda: self._action_queue.put('opacity_up')
+        self.hotkey_manager.on_double_f8 = lambda: self._action_queue.put('opacity_down')
+        self.hotkey_manager.on_double_f9 = lambda: self._action_queue.put('font_up')
+        self.hotkey_manager.on_double_f10 = lambda: self._action_queue.put('font_down')
+        self.hotkey_manager.on_double_f11 = lambda: self._action_queue.put('scroll_up')
+        self.hotkey_manager.on_double_f12 = lambda: self._action_queue.put('scroll_down')
         self.hotkey_manager.start()
 
-    def _request_hide(self): self._pending_action = 'hide'
-    def _request_show(self): self._pending_action = 'show'
-    def _request_kill(self): self._pending_action = 'kill'
-    def _request_copy(self): self._pending_action = 'copy'
-    def _request_capture(self): self._pending_action = 'capture'
-    def _request_opacity_up(self): self._pending_action = 'opacity_up'
-    def _request_opacity_down(self): self._pending_action = 'opacity_down'
-    def _request_font_up(self): self._pending_action = 'font_up'
-    def _request_font_down(self): self._pending_action = 'font_down'
-    def _request_scroll_up(self): self._pending_action = 'scroll_up'
-    def _request_scroll_down(self): self._pending_action = 'scroll_down'
-
     def _poll_hotkey_action(self):
-        """Check flag every 100ms (runs in GUI thread)"""
-        action = self._pending_action
-        if action is None:
-            return
-        self._pending_action = None
+        while not self._action_queue.empty():
+            try:
+                action = self._action_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._dispatch_action(action)
+
+    def _dispatch_action(self, action):
         if action == 'hide':
             self._go_silent()
         elif action == 'show':
@@ -2050,6 +1937,8 @@ class OverlayWindow(QWidget):
             self._kill_app()
         elif action == 'copy':
             self._copy_to_clipboard()
+        elif action == 'toggle_interactive':
+            self._toggle_interactivity()
         elif action == 'capture':
             self._capture_screen()
         elif action == 'opacity_up':
@@ -2065,38 +1954,44 @@ class OverlayWindow(QWidget):
         elif action == 'scroll_down':
             self._scroll_overlay('down')
 
+    def _toggle_interactivity(self):
+        self.is_interactive = not self.is_interactive
+        flags = Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool
+        if not self.is_interactive:
+            flags |= Qt.WindowTransparentForInput
+        self.setWindowFlags(flags)
+        self.show()
+        msg = "Interactive Mode (Clicks active)" if self.is_interactive else "Stealth Pass-Through Mode"
+        self.text_display.append(f'<div style="color: #34C759; font-size: 12px; text-align: center;">⚙ {msg}</div>')
+        self.text_display.moveCursor(QTextCursor.End)
+
     def _scroll_overlay(self, direction):
-        """Scroll overlay text display up or down (F11/F12)"""
         bar = self.text_display.verticalScrollBar()
         if bar:
-            step = max(20, bar.pageStep() // 2)  # Scroll by half a page or 20px min
+            step = max(20, bar.pageStep() // 2)
             if direction == 'up':
                 bar.setValue(max(bar.minimum(), bar.value() - step))
             else:
                 bar.setValue(min(bar.maximum(), bar.value() + step))
 
     def _go_silent(self):
-        """Double F1: hide and stop output"""
         if not self.is_silent:
             self.is_silent = True
             self.hide()
 
     def _restore(self):
-        """Double F2: restore overlay"""
         if self.is_silent:
             self.is_silent = False
             self.show()
             self.raise_()
 
     def _kill_app(self):
-        """Double F3: terminate the application"""
         self.stop_detection()
         if self.hotkey_manager:
             self.hotkey_manager.stop()
         QApplication.quit()
 
     def _copy_to_clipboard(self):
-        """Double F4: copy last answer to clipboard"""
         if self.last_answer:
             clipboard = QApplication.clipboard()
             clipboard.setText(self.last_answer)
@@ -2113,11 +2008,15 @@ class OverlayWindow(QWidget):
             self.text_display.moveCursor(QTextCursor.End)
 
     def _change_font_size(self, delta):
-        """Change overlay answer font size by delta px"""
         self.overlay_font_size = max(10, min(60, self.overlay_font_size + delta))
         self.config["font_size"] = self.overlay_font_size
-        save_config(self.config)
+        self._config_save_timer.start()
         
+        # Apply font size directly to widget default font
+        font = self.text_display.font()
+        font.setPointSize(self.overlay_font_size)
+        self.text_display.setFont(font)
+
         self.text_display.append(
             f'<div style="color: #98989D; font-size: 12px; text-align: center;">'
             f'Font size: {self.overlay_font_size}px</div>'
@@ -2125,11 +2024,10 @@ class OverlayWindow(QWidget):
         self.text_display.moveCursor(QTextCursor.End)
 
     def _change_opacity(self, delta):
-        """Change overlay opacity by delta (F7/F8)"""
         self.overlay_opacity = max(0.2, min(1.0, self.overlay_opacity + delta))
         self.setWindowOpacity(self.overlay_opacity)
         self.config["overlay_opacity"] = self.overlay_opacity
-        save_config(self.config)
+        self._config_save_timer.start()
         self.text_display.append(
             f'<div style="color: #98989D; font-size: 12px; text-align: center;">'
             f'Opacity: {int(self.overlay_opacity * 100)}%</div>'
@@ -2137,7 +2035,6 @@ class OverlayWindow(QWidget):
         self.text_display.moveCursor(QTextCursor.End)
 
     def _capture_screen(self):
-        """F6×2: Capture screen and analyze with vision LLM."""
         if not screen_capture.is_available():
             return
 
@@ -2149,11 +2046,9 @@ class OverlayWindow(QWidget):
             )
             return
 
-        # Temporarily hide overlay to capture clean screenshot
         was_visible = self.isVisible()
         if was_visible:
             self.hide()
-            # Wait a brief moment for the overlay window to hide
             QTimer.singleShot(300, lambda: self._launch_selector_overlay(was_visible, provider))
         else:
             self._launch_selector_overlay(was_visible, provider)
@@ -2174,7 +2069,8 @@ class OverlayWindow(QWidget):
                     'Please switch your session to Xorg (X11) at the login screen.</div>'
                 )
 
-            # Analyze async using thread-safe QObject worker & signals
+            # Use QThread for thread safety
+            self.analysis_thread = QThread()
             self.analysis_worker = ScreenAnalysisWorker(
                 provider=provider,
                 img=img,
@@ -2182,55 +2078,66 @@ class OverlayWindow(QWidget):
                 mode=self.interview_mode,
                 topic=self.topic
             )
-            self.analysis_worker.sig_start.connect(self.on_answer_start)
-            self.analysis_worker.sig_token.connect(self.on_answer_token)
-            self.analysis_worker.sig_done.connect(self.on_answer_done)
-
-            self.analysis_thread = threading.Thread(target=self.analysis_worker.run, daemon=True)
+            self.analysis_worker.moveToThread(self.analysis_thread)
+            self.analysis_worker.sig_start.connect(self.on_answer_start, Qt.QueuedConnection)
+            self.analysis_worker.sig_token.connect(self.on_answer_token, Qt.QueuedConnection)
+            self.analysis_worker.sig_done.connect(self.on_answer_done, Qt.QueuedConnection)
+            self.analysis_worker.sig_done.connect(self.analysis_thread.quit, Qt.QueuedConnection)
+            self.analysis_thread.started.connect(self.analysis_worker.run)
             self.analysis_thread.start()
 
         self.selector = ScreenSelector(on_captured)
         self.selector.show()
 
+    def _trim_old_entries(self):
+        """Keep overlay text buffer bounded to max 50 entries."""
+        self._qa_count += 1
+        if self._qa_count > 50:
+            cursor = self.text_display.textCursor()
+            cursor.movePosition(QTextCursor.Start)
+            cursor.movePosition(QTextCursor.Down, QTextCursor.KeepAnchor, 8)
+            cursor.removeSelectedText()
 
     def on_transcription(self, text, is_question):
-        """Show live transcript as a compact line at top of overlay."""
         if self.is_silent:
             return
         prefix = "❓ " if is_question else "🎤 "
-        self.transcript_label.setText(f"{prefix}{text}")
-        # Reset fade timer
+        self.transcript_label.setText(f"{prefix}{esc(text)}")
         self._transcript_timer.stop()
-        self._transcript_timer.start(5000)  # Fade after 5 seconds
+        self._transcript_timer.start(5000)
 
     def log_message(self, message, level="info"):
-        """Log in overlay — debug only, not shown"""
-        pass  # Overlay shows only Q&A
+        """Display error logs directly in overlay for feedback."""
+        if level == "error" and not self.is_silent:
+            self.text_display.append(
+                f'<div style="color: #FF453A; font-size: 12px; margin: 4px 0;">⚠ {esc(message)}</div>'
+            )
+            self.text_display.moveCursor(QTextCursor.End)
 
     def add_qa(self, question, answer):
-        """Add complete Q&A to overlay (non-streaming fallback)"""
         if self.is_silent: return
         self.last_answer = answer
+        self._trim_old_entries()
         
         fs = self.overlay_font_size
         self.text_display.append(
             f'<div style="margin-bottom: 5px; margin-top: 15px;">'
             f'<div style="color: #0A84FF; font-size: {fs - 2}px; margin-bottom: 4px; font-weight: bold;">'
-            f'Q: {question}</div>'
+            f'Q: {esc(question)}</div>'
             f'<div style="color: #FFFFFF; font-size: {fs}px; line-height: 1.4;">'
-            f'A: {answer}</div>'
+            f'A: {esc(answer)}</div>'
             f'</div>'
         )
         self.text_display.moveCursor(QTextCursor.End)
 
     def on_answer_start(self, question):
-        """Streaming: prepare question block, start empty answer"""
         if self.is_silent: return
+        self._trim_old_entries()
         fs = self.overlay_font_size
         self.text_display.append(
             f'<div style="margin-bottom: 5px; margin-top: 15px;">'
             f'<div style="color: #0A84FF; font-size: {fs - 2}px; margin-bottom: 4px; font-weight: bold;">'
-            f'Q: {question}</div>'
+            f'Q: {esc(question)}</div>'
             f'<div style="color: #FFFFFF; font-size: {fs}px; line-height: 1.4;">'
             f'A: '
         )
@@ -2238,7 +2145,6 @@ class OverlayWindow(QWidget):
         self.text_display.moveCursor(QTextCursor.End)
 
     def on_answer_token(self, token):
-        """Streaming: append one token"""
         if self.is_silent: return
         self._streaming_answer += token
         cursor = self.text_display.textCursor()
@@ -2248,7 +2154,6 @@ class OverlayWindow(QWidget):
         self.text_display.ensureCursorVisible()
 
     def on_answer_done(self, question, answer):
-        """Streaming: finalize answer"""
         self.last_answer = answer
         cursor = self.text_display.textCursor()
         cursor.movePosition(QTextCursor.End)
@@ -2257,17 +2162,18 @@ class OverlayWindow(QWidget):
 
     def start_detection(self):
         signals = WorkerSignals()
-        signals.log.connect(self.log_message)
-        signals.question.connect(self.add_qa)
-        signals.answer_start.connect(self.on_answer_start)
-        signals.answer_token.connect(self.on_answer_token)
-        signals.answer_done.connect(self.on_answer_done)
-        signals.transcription.connect(self.on_transcription)
+        signals.log.connect(self.log_message, Qt.QueuedConnection)
+        signals.answer_start.connect(self.on_answer_start, Qt.QueuedConnection)
+        signals.answer_token.connect(self.on_answer_token, Qt.QueuedConnection)
+        signals.answer_done.connect(self.on_answer_done, Qt.QueuedConnection)
+        signals.transcription.connect(self.on_transcription, Qt.QueuedConnection)
+
         self.worker = AudioDetectorWorker(
             self.device_index, signals, self.sample_rate, self.language,
             self.topic, self.config.get("whisper_prompt", ""),
             self.transcription_provider, self.answer_provider,
-            context_prompt=self.context_prompt, mode=self.interview_mode
+            context_prompt=self.context_prompt, mode=self.interview_mode,
+            auto_correct=self.auto_correct
         )
         self.worker_thread = threading.Thread(target=self.worker.run, daemon=True)
         self.worker_thread.start()
@@ -2278,7 +2184,6 @@ class OverlayWindow(QWidget):
             self.worker = None
 
     def close_and_return(self):
-        """Close overlay and return to configuration"""
         self.stop_detection()
         if self.hotkey_manager:
             self.hotkey_manager.stop()
@@ -2286,7 +2191,6 @@ class OverlayWindow(QWidget):
         self.config_window.show_config()
 
     def keyPressEvent(self, event):
-        """Escape closes overlay and returns to configuration"""
         if event.key() == Qt.Key_Escape:
             self.close_and_return()
         super().keyPressEvent(event)
@@ -2341,7 +2245,6 @@ class HistoryWindow(QDialog):
         # History display
         self.history_text = QTextEdit()
         self.history_text.setReadOnly(True)
-        # Apply specific text edit style from theme colors
         c = COLORS[self.theme]
         self.history_text.setStyleSheet(f"""
             QTextEdit {{
@@ -2360,7 +2263,6 @@ class HistoryWindow(QDialog):
         btn_layout = QHBoxLayout()
         
         clear_btn = ModernButton("Clear All History", self.theme)
-        # Custom danger style for clear button
         danger = COLORS[self.theme]['danger']
         clear_btn.setStyleSheet(f"""
             QPushButton {{
@@ -2387,19 +2289,24 @@ class HistoryWindow(QDialog):
         btn_layout.addWidget(close_btn)
         layout.addLayout(btn_layout)
 
-        # Load history
         self.all_entries = []
         self.load_history()
 
     def load_history(self):
-        """Load history from JSON file"""
+        """Load history from JSONL file with backward compatibility for legacy JSON array."""
         self.all_entries = []
         try:
             if HISTORY_FILE.exists():
-                with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
-                    self.all_entries = json.load(f)
-        except Exception:
-            pass
+                content = HISTORY_FILE.read_text(encoding='utf-8').strip()
+                if content:
+                    if content.startswith('['):
+                        self.all_entries = json.loads(content)
+                    else:
+                        for line in content.splitlines():
+                            if line.strip():
+                                self.all_entries.append(json.loads(line))
+        except Exception as e:
+            print(f"[History] Warning loading history: {e}")
         self.display_entries(self.all_entries)
 
     def display_entries(self, entries):
@@ -2416,7 +2323,6 @@ class HistoryWindow(QDialog):
             )
             return
 
-        # Show newest first
         for entry in reversed(entries):
             ts = entry.get("timestamp", "")
             q = entry.get("question", "")
@@ -2424,30 +2330,28 @@ class HistoryWindow(QDialog):
             lang = entry.get("language", "")
             topic = entry.get("topic", "")
 
-            # Format timestamp
             try:
                 dt = datetime.fromisoformat(ts)
                 ts_fmt = dt.strftime("%Y-%m-%d %H:%M")
             except Exception:
                 ts_fmt = ts
             
-            # Styles for HTML
             meta_style = f"color: {c['text_secondary']}; font-size: 12px; margin-bottom: 4px;"
             q_style = f"color: {c['accent']}; font-weight: bold; margin-bottom: 2px;"
             a_style = f"color: {c['text_primary']}; margin-bottom: 15px;"
 
-            meta = f"<div style='{meta_style}'>{ts_fmt}"
+            meta = f"<div style='{meta_style}'>{esc(ts_fmt)}"
             if lang:
-                meta += f" • {lang}"
+                meta += f" • {esc(lang)}"
             if topic:
-                meta += f" • {topic}"
+                meta += f" • {esc(topic)}"
             meta += "</div>"
 
             self.history_text.append(
                 f'<div style="margin-bottom: 15px;">'
                 f'{meta}'
-                f'<div style="{q_style}">Q: {q}</div>'
-                f'<div style="{a_style}">A: {a}</div>'
+                f'<div style="{q_style}">Q: {esc(q)}</div>'
+                f'<div style="{a_style}">A: {esc(a)}</div>'
                 f'<hr style="border: 0; border-top: 1px solid {c["border"]}; margin: 10px 0;">'
                 f'</div>'
             )
@@ -2467,18 +2371,18 @@ class HistoryWindow(QDialog):
         self.display_entries(filtered)
 
     def clear_history(self):
-        """Clear all history after confirmation"""
-        reply = QMessageBox.question(
-            self, "Clear History",
-            "Are you sure you want to delete all history?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        """Clear all history after confirmation matching theme."""
+        dialog = ModernConfirmDialog(
+            "Clear History",
+            "Are you sure you want to delete all Q&A history?",
+            self.theme, self
         )
-        if reply == QMessageBox.Yes:
+        if dialog.exec_() == QDialog.Accepted:
             try:
                 with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
-                    json.dump([], f)
-            except Exception:
-                pass
+                    f.write('')
+            except Exception as e:
+                print(f"[History] Error clearing history: {e}")
             self.load_history()
 
     def export_to_markdown(self):
@@ -2499,7 +2403,6 @@ class HistoryWindow(QDialog):
             lines = ["# Interview Q&A History\n"]
             lines.append(f"**Total entries:** {len(self.all_entries)}\n")
 
-            # Group by date
             current_date = ""
             for entry in self.all_entries:
                 ts = entry.get("timestamp", "")
@@ -2552,16 +2455,16 @@ class HistoryWindow(QDialog):
 def main():
     app = QApplication(sys.argv)
     
-    # Load config to determine initial theme
+    if IS_LINUX and os.environ.get('XDG_SESSION_TYPE') == 'wayland':
+        print("[System Warning] Wayland session detected. If screen capture returns black images, switch session to Xorg (X11) at login.")
+
     config = load_config()
     theme = config.get("theme", "dark")
     
-    # Validate API keys early
     if not GROQ_API_KEY and not OPENAI_API_KEY:
         print("WARNING: No API keys set. Create .env file with GROQ_API_KEY or OPENAI_API_KEY")
     
-    # Apply global theme (Palette + Stylesheet)
-    app.setStyle('Fusion') # Fusion provides good base for custom palette. Set BEFORE palette!
+    app.setStyle('Fusion')
     apply_theme_palette(app, theme)
 
     window = ConfigWindow()
@@ -2572,3 +2475,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

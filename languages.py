@@ -27,7 +27,7 @@ LANGUAGES = [
     # Additional languages (alphabetical)
     ("Afrikaans", "af", "af", ["wat", "waar", "wanneer", "waarom", "hoe", "wie"]),
     ("Arabic", "ar", "ar", ["ما", "ماذا", "أين", "متى", "لماذا", "كيف", "من", "كم", "هل"]),
-    ("Armenian", "hy", "hy", ["ինչ", "որտեղ", "երբ", "ինusage", "ինչպես", "ով"]),
+    ("Armenian", "hy", "hy", ["ինչ", "որտեղ", "երբ", "ինչու", "ինչպես", "ով"]),
     ("Azerbaijani", "az", "az", ["nə", "hara", "nə vaxt", "niyə", "necə", "kim"]),
     ("Belarusian", "be", "be", ["што", "дзе", "калі", "чаму", "як", "хто"]),
     ("Bosnian", "bs", "bs", ["šta", "gdje", "kada", "zašto", "kako", "ko"]),

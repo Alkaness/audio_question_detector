@@ -62,15 +62,19 @@ class GroqProvider(AIProvider):
         # If we exhausted all keys
         raise Exception("All Groq API keys are currently rate-limited.")
 
-    def transcribe(self, wav_buffer, language="uk", prompt="") -> str:
+    def transcribe(self, wav_buffer, language="en", prompt="") -> str:
         def _do_transcribe():
-            return self.client.audio.transcriptions.create(
-                file=wav_buffer,
-                model=self.DEFAULT_TRANSCRIPTION_MODEL,
-                response_format="text",
-                prompt=prompt,
-                temperature=0.0
-            )
+            wav_buffer.seek(0)
+            kwargs = {
+                "file": wav_buffer,
+                "model": self.DEFAULT_TRANSCRIPTION_MODEL,
+                "response_format": "text",
+                "prompt": prompt,
+                "temperature": 0.0
+            }
+            if language:
+                kwargs["language"] = language
+            return self.client.audio.transcriptions.create(**kwargs)
 
         try:
             transcription = self._execute_with_retry(_do_transcribe)

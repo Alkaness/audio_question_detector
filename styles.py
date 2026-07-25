@@ -40,10 +40,28 @@ def get_stylesheet(theme="dark"):
     c = COLORS[theme]
     
     return f"""
-    QMainWindow, QDialog, QWidget#ConfigWindow {{
+    QMainWindow, QDialog, QWidget#ConfigWindow, QWidget#OverlayWindow {{
         background-color: {c['bg']};
         color: {c['text_primary']};
         {FONTS['ui']}
+    }}
+
+    QCheckBox {{
+        color: {c['text_primary']};
+        font-size: 13px;
+        spacing: 8px;
+        {FONTS['ui']}
+    }}
+    QCheckBox::indicator {{
+        width: 18px;
+        height: 18px;
+        border-radius: 4px;
+        border: 1px solid {c['border']};
+        background-color: {c['input_bg']};
+    }}
+    QCheckBox::indicator:checked {{
+        background-color: {c['accent']};
+        border-color: {c['accent']};
     }}
 
     QLabel {{
@@ -152,3 +170,7 @@ def apply_theme_palette(app, theme="dark"):
     # Also set global stylesheet for common controls if not handled by widgets
     # This helps with message boxes, menus, etc.
     app.setStyleSheet(get_stylesheet(theme))
+    # This helps with message boxes, menus, etc.
+    app.setStyleSheet(get_stylesheet(theme))
+
+

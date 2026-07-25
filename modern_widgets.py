@@ -258,3 +258,78 @@ class ModernDialog(QDialog):
         card_layout.addWidget(btn)
 
         self.setFixedWidth(340)
+
+
+class ModernConfirmDialog(QDialog):
+    """Modern confirmation dialog with Yes/No buttons matching theme"""
+    def __init__(self, title, message, theme="dark", parent=None):
+        super().__init__(parent)
+        self.theme = theme
+        self.setWindowTitle(title)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.setLayout(outer)
+
+        card = ModernCard(theme)
+        card_layout = QVBoxLayout()
+        card_layout.setContentsMargins(24, 24, 24, 24)
+        card_layout.setSpacing(16)
+        card.setLayout(card_layout)
+        outer.addWidget(card)
+
+        c = COLORS[theme]
+
+        # Title
+        lbl_title = QLabel(title)
+        lbl_title.setStyleSheet(f"""
+            font-size: 18px; font-weight: bold;
+            color: {c['text_primary']};
+            {FONTS['ui']}
+        """)
+        card_layout.addWidget(lbl_title)
+
+        # Message
+        lbl_msg = QLabel(message)
+        lbl_msg.setWordWrap(True)
+        lbl_msg.setStyleSheet(f"""
+            color: {c['text_secondary']};
+            font-size: 14px;
+            {FONTS['ui']}
+        """)
+        card_layout.addWidget(lbl_msg)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(12)
+
+        btn_cancel = ModernButton("Cancel", theme)
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+
+        btn_confirm = ModernButton("Confirm", theme, accent=True)
+        btn_confirm.clicked.connect(self.accept)
+        btn_row.addWidget(btn_confirm)
+
+        card_layout.addLayout(btn_row)
+        self.setFixedWidth(360)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        c = COLORS[self.theme]
+        
+        # Outlined dot
+        color = QColor(self.color)
+        if self.is_pulsing:
+            color.setAlpha(self._pulse_alpha)
+            
+        painter.setBrush(color)
+        painter.setPen(QPen(QColor(c['border']), 1))
+        painter.drawEllipse(2, 2, self.width() - 4, self.height() - 4)
+
+
+
